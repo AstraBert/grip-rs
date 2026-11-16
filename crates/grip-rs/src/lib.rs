@@ -1,26 +1,28 @@
 use std::{collections::BTreeMap, fs, io, path::Path, sync::Mutex};
 
 use crate::{
+    disk::{decode_sparse_sketches, encode_vectors},
     hashprune::{Reservoir, insert_in_reservoir, make_projection, make_sketch},
     leaf::build_leaf_edges,
     partition::partition,
     robustprune::{MAX_GRAPH_DEGREE, robust_prune},
     seeding::{SeedVecs, build_seed_list, encode_seed_vecs, read_seed_vec_from_bytes},
-    types::{BuildParams, QuantizedSparseVector, SparseVector},
 };
 use arrayvec::ArrayVec;
 use half::bf16;
 use rayon::prelude::*;
 
+pub mod disk;
 pub mod hashprune;
 pub mod leaf;
 pub mod partition;
 pub mod robustprune;
 mod search;
 pub mod seeding;
-pub mod types;
+mod types;
 
 pub use search::*;
+pub use types::*;
 
 pub type IndexBuildOutput = Result<
     (
@@ -62,7 +64,14 @@ pub fn build_index(vectors: Vec<SparseVector>, params: BuildParams) -> IndexBuil
         .par_iter()
         .map(|leaf| {
             let mut scores = vec![0.0_f32; leaf.len() * leaf.len()];
-            let edges = build_leaf_edges(leaf, params.leaf_k, &mut scores, &borrowed_vectors);
+            let mut triples = Vec::with_capacity(leaf.len());
+            let edges = build_leaf_edges(
+                leaf,
+                params.leaf_k,
+                &mut scores,
+                &borrowed_vectors,
+                &mut triples,
+            );
             for (src, dst, score) in edges {
                 let mut res = reservoirs[src as usize].lock().map_err(|e| e.to_string())?;
                 insert_in_reservoir(
@@ -124,21 +133,28 @@ pub fn save_vectors_and_sketches(
     vectors: Vec<SparseVector>,
     sketches: Vec<QuantizedSparseVector>,
     scale: f32,
-    dest: impl AsRef<Path>,
-) -> Result<(), String> {
-    let value: VectorsAndSketches = VectorsAndSketches {
-        vectors,
-        sketches,
-        scale,
-    };
-    let content = postcard::to_allocvec(&value).map_err(|e| e.to_string())?;
-    fs::write(dest, content).map_err(|e| e.to_string())
+    dest_vectors: impl AsRef<Path>,
+    dest_sketches: impl AsRef<Path>,
+) -> io::Result<()> {
+    let vectors_encoded = encode_vectors(&vectors.iter().collect::<Vec<&SparseVector>>(), 4, None);
+    let sketches_encoded = encode_vectors(
+        &sketches.iter().collect::<Vec<&QuantizedSparseVector>>(),
+        1,
+        Some(scale),
+    );
+    fs::write(dest_vectors, vectors_encoded)?;
+    fs::write(dest_sketches, sketches_encoded)
 }
 
-pub fn read_vectors_and_sketches(src: impl AsRef<Path>) -> Result<VectorsAndSketches, String> {
+pub fn read_sketches(src: impl AsRef<Path>) -> Result<VectorsAndSketches, String> {
     let content = fs::read(src).map_err(|e| e.to_string())?;
-    let val: VectorsAndSketches = postcard::from_bytes(&content).map_err(|e| e.to_string())?;
-    Ok(val)
+    let (offsets, indices, values, scale) = decode_sparse_sketches(&content, None)?;
+    Ok(VectorsAndSketches {
+        offsets,
+        indices,
+        values,
+        scale,
+    })
 }
 
 pub fn save_index(

@@ -52,7 +52,7 @@ fn fanout_for_dept(depth: usize) -> usize {
     } else if depth == 1 {
         return 3;
     }
-    2
+    1
 }
 
 fn pop_random<T, R: Rng + ?Sized>(pool: &mut Vec<T>, rng: &mut R) -> T {

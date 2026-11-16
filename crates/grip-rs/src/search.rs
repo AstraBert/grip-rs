@@ -1,23 +1,41 @@
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BinaryHeap, HashMap},
+    collections::{BTreeMap, BinaryHeap},
 };
 
+use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    disk::decode_sparse_vectors_raw,
     seeding::SeedVecs,
     types::{QuantizedSparseVector, SearchParams, SparseVector, SparseVectorSortKey},
 };
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct VectorsAndSketches {
-    pub vectors: Vec<SparseVector>,
-    pub sketches: Vec<QuantizedSparseVector>,
+    pub offsets: Vec<usize>,
+    pub indices: Vec<u32>,
+    pub values: Vec<u8>,
     pub scale: f32,
 }
 
-#[derive(Debug)]
+impl VectorsAndSketches {
+    pub fn get<'a>(&'a self, index: usize) -> Option<(&'a [u32], &'a [u8])> {
+        let offset_start = self.offsets.get(index);
+        let offset_end = self.offsets.get(index + 1);
+        if offset_end.is_none() || offset_start.is_none() {
+            return None;
+        }
+        let (start, end) = (offset_start.unwrap(), offset_end.unwrap());
+        let indices = &self.indices[*start..*end];
+        let values = &self.values[*start..*end];
+
+        Some((indices, values))
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct IndexOutput {
     pub graph: Vec<u32>,
     pub seeds: SeedVecs,
@@ -34,6 +52,7 @@ impl IndexOutput {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Visited {
     pub counter: u32,
     pub visited: Vec<u32>,
@@ -76,8 +95,14 @@ pub fn search(
     index_output: &IndexOutput,
     params: SearchParams,
     visited: &mut Visited,
+    dense: &mut Vec<u8>,
+    dense_rescoring: &mut Vec<f32>,
+    sparse_vectors_mmap: &Mmap,
 ) -> Result<Vec<(u32, f32)>, String> {
     let q8 = query.quantize(vectors_and_sketches.scale)?;
+    for (t, w) in q8.indices.iter().zip(q8.values.iter()) {
+        dense[*t as usize] = *w;
+    }
     let mut by_impact = q8.clone();
     by_impact.sort_with_fn(|el_a: (u32, u8), el_b: (u32, u8)| {
         let max_weigth_a = index_output.term_max.get(&el_a.0).unwrap_or(&0_f32);
@@ -107,7 +132,15 @@ pub fn search(
     entry_points.dedup();
     for &e in &entry_points {
         visited.visited[e as usize] = visited.counter;
-        let score = q8.dot_unscaled(&vectors_and_sketches.sketches[e as usize]);
+        let mut score = 0u32;
+        let sketch = vectors_and_sketches.get(e as usize);
+        if sketch.is_none() {
+            return Err("Tried to read an out-of-bounds vector".to_string());
+        }
+        let sketch = sketch.unwrap();
+        for (i, w) in sketch.0.iter().zip(sketch.1.iter()) {
+            score += *w as u32 * dense[*i as usize] as u32;
+        }
         candidates.push((score, e));
         maybe_add_result(&mut results, params.ef, score, e);
     }
@@ -122,7 +155,15 @@ pub fn search(
             }
             if visited.visited[*nb as usize] != visited.counter {
                 visited.visited[*nb as usize] = visited.counter;
-                let score = q8.dot_unscaled(&vectors_and_sketches.sketches[*nb as usize]);
+                let mut score = 0u32;
+                let sketch = vectors_and_sketches.get(*nb as usize);
+                if sketch.is_none() {
+                    return Err("Tried to read an out-of-bounds vector".to_string());
+                }
+                let sketch = sketch.unwrap();
+                for (i, w) in sketch.0.iter().zip(sketch.1.iter()) {
+                    score += *w as u32 * dense[*i as usize] as u32;
+                }
                 let added = maybe_add_result(&mut results, params.ef, score, *nb);
                 if added {
                     candidates.push((score, *nb));
@@ -135,15 +176,43 @@ pub fn search(
         }
     }
 
-    let mut exact_scores: HashMap<u32, f32> = HashMap::new();
-    for node in results {
-        let exact_score = query.dot(&vectors_and_sketches.vectors[node.1 as usize]);
-        exact_scores.insert(node.1, exact_score);
+    let res = results.into_sorted_vec();
+
+    // reset dense for reuse
+    for t in q8.indices.iter() {
+        dense[*t as usize] = 0;
     }
 
-    let mut entries = exact_scores.iter().collect::<Vec<(&u32, &f32)>>();
-    entries.sort_by(|(_, va), (_, vb)| (**vb).total_cmp(*va));
-    entries.truncate(params.top_k);
+    let mut exact_scores: Vec<(u32, f32)> = Vec::new();
+    let mut ids: Vec<u32> = res.iter().map(|r| r.1).collect();
+    if ids.len() > params.top_k * params.rescore_factor {
+        ids.truncate(params.top_k * params.rescore_factor);
+    }
+    let vectors = decode_sparse_vectors_raw(
+        sparse_vectors_mmap,
+        Some(ids.iter().map(|&i| i as usize).collect()),
+    )?;
 
-    Ok(entries.iter().map(|(i, v)| (**i, **v)).collect())
+    // reset dense for reuse
+    for (t, w) in query.indices.iter().zip(query.values.iter()) {
+        dense_rescoring[*t as usize] = *w;
+    }
+
+    for (id, v) in ids.iter().zip(vectors.iter()) {
+        let mut score = 0_f32;
+        for (i, w) in v.iter() {
+            score += dense_rescoring[*i as usize] * *w;
+        }
+        exact_scores.push((*id, score));
+    }
+
+    // clean before returning
+    for t in query.indices.iter() {
+        dense_rescoring[*t as usize] = 0_f32;
+    }
+
+    exact_scores.sort_by(|(_, va), (_, vb)| (*vb).total_cmp(va));
+    exact_scores.truncate(params.top_k);
+
+    Ok(exact_scores.iter().map(|(i, v)| (*i, *v)).collect())
 }

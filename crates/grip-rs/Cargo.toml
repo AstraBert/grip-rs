@@ -1,0 +1,25 @@
+[package]
+name = "grip-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rand_distr = "0.6"
+rand = "0.10"
+half = "2.7.1"
+arrayvec = "0.7.8"
+rayon = "1.12.0"
+serde = { workspace = true }
+ordered-float = { version = "5.5.1", features = ["serde"] }
+num-traits = "0.2.19"
+memmap2 = { workspace = true }
+clap = { workspace = true, optional = true }
+
+[features]
+default = []
+cli = ["dep:clap"]
+
+[[bin]]
+name = "grip-index"
+path = "src/main.rs"
+required-features = ["cli"]
