@@ -89,30 +89,21 @@ fn maybe_add_result(
     }
 }
 
-pub fn search(
-    query: &SparseVector,
-    vectors_and_sketches: &VectorsAndSketches,
-    index_output: &IndexOutput,
-    params: SearchParams,
-    visited: &mut Visited,
-    dense: &mut Vec<u8>,
-    dense_rescoring: &mut Vec<f32>,
-    sparse_vectors_mmap: &Mmap,
-) -> Result<Vec<(u32, f32)>, String> {
-    let q8 = query.quantize(vectors_and_sketches.scale)?;
-    for (t, w) in q8.indices.iter().zip(q8.values.iter()) {
-        dense[*t as usize] = *w;
-    }
-    let mut by_impact = q8.clone();
+pub fn compute_entry_points(
+    by_impact: &mut QuantizedSparseVector,
+    seeds: &SeedVecs,
+    term_max: &BTreeMap<u32, f32>,
+    max_query_dims: usize,
+) -> Vec<u32> {
     by_impact.sort_with_fn(|el_a: (u32, u8), el_b: (u32, u8)| {
-        let max_weigth_a = index_output.term_max.get(&el_a.0).unwrap_or(&0_f32);
-        let max_weigth_b = index_output.term_max.get(&el_b.0).unwrap_or(&0_f32);
+        let max_weigth_a = term_max.get(&el_a.0).unwrap_or(&0_f32);
+        let max_weigth_b = term_max.get(&el_b.0).unwrap_or(&0_f32);
         (el_b.1 as f32 * *max_weigth_b).total_cmp(&(*max_weigth_a * el_a.1 as f32))
     });
-    by_impact.truncate(params.max_query_dims);
+    by_impact.truncate(max_query_dims);
     let mut entry_points = vec![];
     for t in by_impact.indices.iter() {
-        let seeds = index_output.seeds.get(t);
+        let seeds = seeds.get(t);
         if let Some(sds) = seeds {
             for s in sds {
                 entry_points.push(s.1);
@@ -125,12 +116,25 @@ pub fn search(
         // seeds
         entry_points = vec![0];
     }
+    entry_points
+}
+
+pub fn run_beam_search(
+    q8: &QuantizedSparseVector,
+    visited: &mut Visited,
+    entry_points: &mut Vec<u32>,
+    vectors_and_sketches: &VectorsAndSketches,
+    dense: &mut Vec<u8>,
+    graph: &[u32],
+    ef: usize,
+    patience: usize,
+) -> Result<Vec<(Reverse<u32>, u32)>, String> {
     let mut candidates: BinaryHeap<(u32, u32)> = BinaryHeap::new();
     let mut results: BinaryHeap<(Reverse<u32>, u32)> = BinaryHeap::new();
     visited.counter += 1; // move this line above the seeding
     entry_points.sort_unstable();
     entry_points.dedup();
-    for &e in &entry_points {
+    for &e in entry_points.iter() {
         visited.visited[e as usize] = visited.counter;
         let mut score = 0u32;
         let sketch = vectors_and_sketches.get(e as usize);
@@ -142,14 +146,14 @@ pub fn search(
             score += *w as u32 * dense[*i as usize] as u32;
         }
         candidates.push((score, e));
-        maybe_add_result(&mut results, params.ef, score, e);
+        maybe_add_result(&mut results, ef, score, e);
     }
     let mut no_change = 0;
 
-    while !candidates.is_empty() && no_change < params.patience {
+    while !candidates.is_empty() && no_change < patience {
         let (_, node) = candidates.pop().unwrap();
         let mut changed = false;
-        for nb in &index_output.graph[(node as usize) * 64..(node as usize + 1) * 64] {
+        for nb in &graph[(node as usize) * 64..(node as usize + 1) * 64] {
             if *nb == u32::MAX {
                 break;
             }
@@ -164,7 +168,7 @@ pub fn search(
                 for (i, w) in sketch.0.iter().zip(sketch.1.iter()) {
                     score += *w as u32 * dense[*i as usize] as u32;
                 }
-                let added = maybe_add_result(&mut results, params.ef, score, *nb);
+                let added = maybe_add_result(&mut results, ef, score, *nb);
                 if added {
                     candidates.push((score, *nb));
                     changed = true;
@@ -183,8 +187,17 @@ pub fn search(
         dense[*t as usize] = 0;
     }
 
+    Ok(res)
+}
+
+pub fn rescore(
+    ids: &mut Vec<u32>,
+    query: &SparseVector,
+    sparse_vectors_mmap: &Mmap,
+    dense_rescoring: &mut Vec<f32>,
+    params: &SearchParams,
+) -> Result<Vec<(u32, f32)>, String> {
     let mut exact_scores: Vec<(u32, f32)> = Vec::new();
-    let mut ids: Vec<u32> = res.iter().map(|r| r.1).collect();
     if ids.len() > params.top_k * params.rescore_factor {
         ids.truncate(params.top_k * params.rescore_factor);
     }
@@ -215,4 +228,45 @@ pub fn search(
     exact_scores.truncate(params.top_k);
 
     Ok(exact_scores.iter().map(|(i, v)| (*i, *v)).collect())
+}
+
+pub fn search(
+    query: &SparseVector,
+    vectors_and_sketches: &VectorsAndSketches,
+    index_output: &IndexOutput,
+    params: SearchParams,
+    visited: &mut Visited,
+    dense: &mut Vec<u8>,
+    dense_rescoring: &mut Vec<f32>,
+    sparse_vectors_mmap: &Mmap,
+) -> Result<Vec<(u32, f32)>, String> {
+    let q8 = query.quantize(vectors_and_sketches.scale)?;
+    for (t, w) in q8.indices.iter().zip(q8.values.iter()) {
+        dense[*t as usize] = *w;
+    }
+    let mut by_impact = q8.clone();
+    let mut entry_points = compute_entry_points(
+        &mut by_impact,
+        &index_output.seeds,
+        &index_output.term_max,
+        params.max_query_dims,
+    );
+    let res = run_beam_search(
+        &q8,
+        visited,
+        &mut entry_points,
+        vectors_and_sketches,
+        dense,
+        &index_output.graph,
+        params.ef,
+        params.patience,
+    )?;
+    let mut ids = res.iter().map(|v| v.1).collect();
+    rescore(
+        &mut ids,
+        query,
+        sparse_vectors_mmap,
+        dense_rescoring,
+        &params,
+    )
 }

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub trait Vector<'a, T: ToBytes + FromBytes> {
     fn indices(&'a self) -> &'a [u32];
     fn values(&'a self) -> &'a [T];
+    fn len(&self) -> usize;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +23,10 @@ impl<'a> Vector<'a, f32> for SparseVector {
     fn values(&'a self) -> &'a [f32] {
         &self.values
     }
+
+    fn len(&self) -> usize {
+        self.indices.len()
+    }
 }
 
 impl<'a> Vector<'a, u8> for QuantizedSparseVector {
@@ -31,6 +36,10 @@ impl<'a> Vector<'a, u8> for QuantizedSparseVector {
 
     fn values(&'a self) -> &'a [u8] {
         &self.values
+    }
+
+    fn len(&self) -> usize {
+        self.indices.len()
     }
 }
 
@@ -281,6 +290,11 @@ pub struct BuildParams {
     pub robust_prune_alpha: f32,
     pub entrypoint_seeds: usize,
     pub sketch_size: usize,
+    /// Fanout of the partition at depth 0 and at depth 1. Deeper levels use 1.
+    pub fanouts: [usize; 2],
+    pub refinement_query_dims: Option<usize>,
+    pub refinement_ef: Option<usize>,
+    pub refinement_patience: Option<usize>,
 }
 
 impl BuildParams {
@@ -293,6 +307,11 @@ impl BuildParams {
         robust_prune_alpha: f32,
         entrypoint_seeds: usize,
         sketch_size: usize,
+        fanout_depth0: usize,
+        fanout_depth1: usize,
+        refinement_query_dims: Option<usize>,
+        refinement_ef: Option<usize>,
+        refinement_patience: Option<usize>,
     ) -> Result<Self, String> {
         let s = Self {
             m,
@@ -303,6 +322,31 @@ impl BuildParams {
             robust_prune_alpha,
             entrypoint_seeds,
             sketch_size,
+            fanouts: [fanout_depth0, fanout_depth1],
+            refinement_query_dims: refinement_query_dims.map_or_else(
+                || {
+                    if refine { Some(2) } else { None }
+                },
+                |v| {
+                    if refine { Some(v) } else { None }
+                },
+            ),
+            refinement_ef: refinement_ef.map_or_else(
+                || {
+                    if refine { Some(100) } else { None }
+                },
+                |v| {
+                    if refine { Some(v) } else { None }
+                },
+            ),
+            refinement_patience: refinement_patience.map_or_else(
+                || {
+                    if refine { Some(20) } else { None }
+                },
+                |v| {
+                    if refine { Some(v) } else { None }
+                },
+            ),
         };
         s.validate()?;
         Ok(s)
@@ -311,6 +355,9 @@ impl BuildParams {
     pub fn validate(&self) -> Result<(), String> {
         if self.m > 16 {
             return Err("m cannot be larger than 16".to_string());
+        }
+        if self.fanouts.iter().any(|&f| f == 0) {
+            return Err("the fanouts must be at least 1".to_string());
         }
         Ok(())
     }

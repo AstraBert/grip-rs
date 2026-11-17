@@ -69,6 +69,24 @@ struct BuildArgs {
     /// Number of components kept in the routing sketch of each document
     #[arg(long, default_value_t = 80)]
     sketch_size: usize,
+    /// Fanout of the partition at depth 0: each point goes to this many groups
+    #[arg(long, default_value_t = 10)]
+    fanout_depth0: usize,
+    /// Fanout of the partition at depth 1 (deeper levels always use 1)
+    #[arg(long, default_value_t = 3)]
+    fanout_depth1: usize,
+    /// Run a refinement pass: search each point in the built graph and prune the results
+    #[arg(long)]
+    refine: bool,
+    /// Number of terms of a document used to pick the entry points of the refinement search (default 2)
+    #[arg(long, requires = "refine")]
+    refinement_query_dims: Option<usize>,
+    /// Size of the results set of the refinement search (default 100)
+    #[arg(long, requires = "refine")]
+    refinement_ef: Option<usize>,
+    /// Stop the refinement search after this many expansions without a change (default 20)
+    #[arg(long, requires = "refine")]
+    refinement_patience: Option<usize>,
 }
 
 #[derive(Args)]
@@ -161,22 +179,25 @@ fn run_build(args: BuildArgs) -> Result<(), Box<dyn Error>> {
             .unwrap_or(0)
     });
 
-    // `refine` is not implemented yet, so it is always false
     let params = BuildParams::new(
         args.m,
         args.seed,
         vocab_size,
         args.leaf_k,
-        false,
+        args.refine,
         args.alpha,
         args.entrypoint_seeds,
         args.sketch_size,
+        args.fanout_depth0,
+        args.fanout_depth1,
+        args.refinement_query_dims,
+        args.refinement_ef,
+        args.refinement_patience,
     )?;
 
     fs::create_dir_all(&args.output_dir)?;
 
     let t = Instant::now();
-    // the vectors are cloned because `build_index` takes ownership of them
     let (graph, seeds, term_max, sketches, scale) = build_index(&vectors, params)?;
     eprintln!("built the index in {:.1?}", t.elapsed());
 

@@ -36,6 +36,136 @@ pub type IndexBuildOutput = Result<
     String,
 >;
 
+struct Scratch {
+    visited: Visited,
+    dense: Vec<u8>,
+}
+
+impl Scratch {
+    fn new(vocab_size: usize, n_docs: usize) -> Self {
+        Self {
+            visited: Visited {
+                counter: 0,
+                visited: vec![0_u32; n_docs],
+            },
+            dense: vec![0_u8; vocab_size],
+        }
+    }
+}
+
+fn refine(
+    graph: &[u32],
+    vectors: &[SparseVector],
+    sketches: &[QuantizedSparseVector],
+    seeds: &SeedVecs,
+    term_max: &BTreeMap<u32, f32>,
+    params: &BuildParams,
+    scale: f32,
+) -> Result<Vec<u32>, String> {
+    let capacity: usize = sketches.iter().map(|v| v.len()).sum();
+
+    let mut offsets: Vec<usize> = sketches
+        .iter()
+        .scan(0, |running, v| {
+            let start = *running;
+            *running += v.len();
+            Some(start)
+        })
+        .collect();
+
+    offsets.push(capacity);
+
+    let mut indices = Vec::with_capacity(capacity);
+    let mut values = Vec::with_capacity(capacity);
+
+    for v in sketches {
+        indices.extend_from_slice(&v.indices);
+        values.extend_from_slice(&v.values);
+    }
+
+    let vectors_and_sketches = &VectorsAndSketches {
+        offsets,
+        indices,
+        values,
+        scale,
+    };
+
+    // built once, not for every point
+    let borrowed_vectors = vectors.iter().collect::<Vec<&SparseVector>>();
+
+    let mut graph_new = vec![u32::MAX; vectors.len() * MAX_GRAPH_DEGREE];
+    graph_new
+        .par_chunks_mut(MAX_GRAPH_DEGREE)
+        .enumerate()
+        .try_for_each_init(
+            || Scratch::new(params.vocab_size, sketches.len()),
+            |scratch, (p, row)| -> Result<(), String> {
+                let me = p as u32;
+
+                // the beam search reads the query from `dense`,
+                // and resets it before returning
+                for (t, w) in sketches[p].indices.iter().zip(sketches[p].values.iter()) {
+                    scratch.dense[*t as usize] = *w;
+                }
+
+                // skip the padding of the row
+                let neighbours: Vec<u32> = graph[p * MAX_GRAPH_DEGREE..(p + 1) * MAX_GRAPH_DEGREE]
+                    .iter()
+                    .copied()
+                    .filter(|&nb| nb != u32::MAX)
+                    .collect();
+
+                let mut by_impact = sketches[p].clone();
+                let mut starts = compute_entry_points(
+                    &mut by_impact,
+                    seeds,
+                    term_max,
+                    params.refinement_query_dims.unwrap(),
+                );
+                starts.extend_from_slice(&neighbours);
+                // the point itself is not a start
+                // (the beam search sorts and dedups the starts)
+                starts.retain(|&s| s != me);
+
+                let found = run_beam_search(
+                    &sketches[p],
+                    &mut scratch.visited,
+                    &mut starts,
+                    vectors_and_sketches,
+                    &mut scratch.dense,
+                    graph,
+                    params.refinement_ef.unwrap(),
+                    params.refinement_patience.unwrap(),
+                )?;
+
+                let mut pool = found.iter().map(|v| v.1).collect::<Vec<u32>>();
+                pool.extend_from_slice(&neighbours);
+                // dedup only removes equal neighbours, so sort first
+                pool.sort_unstable();
+                pool.dedup();
+                // a point is not its own neighbour
+                pool.retain(|&id| id != me);
+
+                let exact_scores = pool
+                    .iter()
+                    .map(|id| {
+                        let score = vectors[p].dot(&vectors[*id as usize]);
+                        (*id, score)
+                    })
+                    .collect::<Vec<(u32, f32)>>();
+                let pruned = robust_prune::<f32>(
+                    &exact_scores,
+                    params.robust_prune_alpha,
+                    &borrowed_vectors,
+                );
+                row.copy_from_slice(&pruned);
+                Ok(())
+            },
+        )?;
+
+    Ok(graph_new)
+}
+
 pub fn build_index(vectors: &[SparseVector], params: BuildParams) -> IndexBuildOutput {
     let mut phases = Phases::new("build_index");
 
@@ -62,6 +192,7 @@ pub fn build_index(vectors: &[SparseVector], params: BuildParams) -> IndexBuildO
         &(0..vectors.len()).map(|i| i as u32).collect::<Vec<u32>>(),
         0,
         params.seed,
+        params.fanouts,
     );
     phases.mark("partition");
     phases.note(|| {
@@ -126,8 +257,8 @@ pub fn build_index(vectors: &[SparseVector], params: BuildParams) -> IndexBuildO
         .enumerate()
         .try_for_each(|(p, row)| -> Result<(), String> {
             let candidates = reservoirs[p].lock().map_err(|e| e.to_string())?;
-            let kept = robust_prune(
-                &candidates.slots,
+            let kept = robust_prune::<half::bf16>(
+                &candidates.slots.iter().map(|s| (s.id, s.score)).collect(),
                 params.robust_prune_alpha,
                 &borrowed_vectors,
             );
@@ -155,6 +286,20 @@ pub fn build_index(vectors: &[SparseVector], params: BuildParams) -> IndexBuildO
         .map(|v| make_routing_sketch(v, params.sketch_size, scale))
         .collect::<Result<Vec<QuantizedSparseVector>, String>>()?;
     phases.mark("routing sketches");
+
+    if params.refine {
+        graph = refine(
+            &graph,
+            vectors,
+            &routing_sketches,
+            &seeds,
+            &term_max,
+            &params,
+            scale,
+        )?;
+
+        phases.mark("refine");
+    }
 
     Ok((graph, seeds, term_max, routing_sketches, scale))
 }

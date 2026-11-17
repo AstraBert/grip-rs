@@ -46,13 +46,9 @@ pub fn compute_hash<T: Hash>(value: &T) -> u64 {
     hasher.finish()
 }
 
-fn fanout_for_dept(depth: usize) -> usize {
-    if depth == 0 {
-        return 10;
-    } else if depth == 1 {
-        return 3;
-    }
-    1
+/// `fanouts` holds the fanout of depth 0 and of depth 1. Deeper levels always use 1.
+fn fanout_for_dept(depth: usize, fanouts: [usize; 2]) -> usize {
+    fanouts.get(depth).copied().unwrap_or(1)
 }
 
 fn pop_random<T, R: Rng + ?Sized>(pool: &mut Vec<T>, rng: &mut R) -> T {
@@ -86,7 +82,13 @@ fn merge_small_groups_randomly<T, R: Rng + ?Sized>(
     }
 }
 
-pub fn partition(vectors: &[&SparseVector], ids: &[u32], depth: usize, seed: u64) -> Vec<Vec<u32>> {
+pub fn partition(
+    vectors: &[&SparseVector],
+    ids: &[u32],
+    depth: usize,
+    seed: u64,
+    fanouts: [usize; 2],
+) -> Vec<Vec<u32>> {
     if depth > MAX_DEPTH {
         return vec![ids.to_vec()];
     }
@@ -99,7 +101,7 @@ pub fn partition(vectors: &[&SparseVector], ids: &[u32], depth: usize, seed: u64
     }
 
     let n = points.len();
-    let fanout = fanout_for_dept(depth);
+    let fanout = fanout_for_dept(depth, fanouts);
     let leader_count = ((LEADER_FRACTION * n as f64) as usize)
         .clamp(4 * fanout, 1000)
         .min(n);
@@ -156,7 +158,7 @@ pub fn partition(vectors: &[&SparseVector], ids: &[u32], depth: usize, seed: u64
         .map(|(gid, g)| {
             let sub_vectors: Vec<&SparseVector> = g.iter().map(|&p| vectors[p as usize]).collect();
             let sub_ids: Vec<u32> = g.iter().map(|&p| ids[p as usize]).collect();
-            partition(&sub_vectors, &sub_ids, depth + 1, seed + gid as u64)
+            partition(&sub_vectors, &sub_ids, depth + 1, seed + gid as u64, fanouts)
         })
         .collect::<Vec<Vec<Vec<u32>>>>()
         .into_iter()
