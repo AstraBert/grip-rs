@@ -18,6 +18,8 @@ from typing import NamedTuple, TypedDict
 
 import httpx
 
+QUALITY_PERCENTILES = (5, 10, 25, 50)
+
 
 class SparseVector(TypedDict):
     indices: list[int]
@@ -41,6 +43,13 @@ class Sample(NamedTuple):
     latency_ms: float
     search_ms: float
     ok: bool
+    ids: list[int]
+
+
+class Quality(NamedTuple):
+    recall: float
+    mrr: float
+    ndcg: float
 
 
 @dataclass
@@ -52,6 +61,7 @@ class Config:
     warmup: int
     levels: list[int]
     options: dict[str, int]
+    ground_truth: Path | None
 
 
 @dataclass
@@ -83,6 +93,11 @@ def parse_args() -> Config:
         "--warmup", type=int, default=200, help="requests before measuring"
     )
     parser.add_argument("--levels", type=int, nargs="+", default=[1, 2, 4, 8, 16])
+    parser.add_argument(
+        "--groundtruth",
+        type=Path,
+        help="TSV of the exact neighbors (query, document, rank, score), to report quality",
+    )
     for name in ("top-k", "ef", "patience", "max-query-dims", "rescore-factor"):
         parser.add_argument(f"--{name}", type=int)
     args = parser.parse_args()
@@ -97,6 +112,7 @@ def parse_args() -> Config:
         args.warmup,
         args.levels,
         options,
+        args.groundtruth,
     )
 
 
@@ -120,8 +136,9 @@ async def timed_search(
     response = await client.post("/search", json={"vector": vector, **options})
     latency_ms = (time.perf_counter() - start) * 1000
     if response.status_code != 200:
-        return Sample(latency_ms, 0.0, False)
-    return Sample(latency_ms, SearchResponse(**response.json())["search_time"], True)
+        return Sample(latency_ms, 0.0, False, [])
+    body = SearchResponse(**response.json())
+    return Sample(latency_ms, body["search_time"], True, body["ids"])
 
 
 async def run_level(
@@ -186,6 +203,69 @@ def print_table(results: list[LevelResult]) -> None:
     )
 
 
+def read_ground_truth(path: Path, n_queries: int) -> list[list[int]]:
+    """Exact neighbors of each query, best first. A line is: query, document, rank, score."""
+    ranked: dict[int, list[tuple[int, int]]] = {}
+    for line in path.read_text().splitlines():
+        query, doc, rank, _ = line.split("\t")
+        if int(query) < n_queries:
+            ranked.setdefault(int(query), []).append((int(rank), int(doc)))
+    if len(ranked) < n_queries:
+        raise SystemExit(
+            f"{path} has ground truth for {len(ranked)} queries, expected {n_queries}"
+        )
+    return [[doc for _, doc in sorted(ranked[q])] for q in range(n_queries)]
+
+
+def score_query(returned: list[int], expected: list[int]) -> Quality:
+    """Recall, MRR and nDCG, with the exact neighbors as the relevant set."""
+    k = len(expected)
+    relevant = set(expected)
+    hit_ranks = [rank for rank, doc in enumerate(returned[:k]) if doc in relevant]
+    recall = len(hit_ranks) / k
+    mrr = 1 / (hit_ranks[0] + 1) if hit_ranks else 0.0
+    dcg = sum(1 / math.log2(rank + 2) for rank in hit_ranks)
+    ideal_dcg = sum(1 / math.log2(rank + 2) for rank in range(k))
+    return Quality(recall, mrr, dcg / ideal_dcg)
+
+
+async def measure_quality(
+    config: Config, queries: list[SparseVector], truth: list[list[int]]
+) -> list[Quality]:
+    """Send every query once. The results do not depend on the concurrency."""
+    concurrency = min(4, max(config.levels))
+    samples, _ = await run_level(config, queries, concurrency, len(queries))
+    failed = sum(not sample.ok for sample in samples)
+    if failed:
+        print(f"WARNING: {failed} queries failed, they count as zero in the quality\n")
+    return [
+        score_query(sample.ids, expected)
+        for sample, expected in zip(samples, truth, strict=True)
+    ]
+
+
+def print_quality(scores: list[Quality], k: int) -> None:
+    columns = (
+        ("recall", [s.recall for s in scores]),
+        ("MRR", [s.mrr for s in scores]),
+        ("nDCG", [s.ndcg for s in scores]),
+    )
+    header = f"{'metric':<8}{'mean':>9}" + "".join(
+        f"{f'p{q}':>9}" for q in QUALITY_PERCENTILES
+    )
+    print(
+        f"Quality at {k} over {len(scores)} queries, ground truth is the exact top {k}\n"
+    )
+    print(header)
+    for name, values in columns:
+        cuts = statistics.quantiles(values, n=100, method="inclusive")
+        percentiles = "".join(f"{cuts[q - 1]:>9.4f}" for q in QUALITY_PERCENTILES)
+        print(f"{name:<8}{statistics.fmean(values):>9.4f}{percentiles}")
+    print(
+        "\np5 is the value that 5% of the queries are below, so a low p5 means a bad tail.\n"
+    )
+
+
 async def read_info(config: Config) -> Info | None:
     async with httpx.AsyncClient(base_url=config.url.rstrip("/"), timeout=10) as client:
         try:
@@ -207,7 +287,12 @@ async def run_bench(config: Config) -> int:
     )
 
     queries = read_queries(config.queries, config.n_queries)
+    truth = None
+    if config.ground_truth is not None:
+        truth = read_ground_truth(config.ground_truth, len(queries))
     await run_level(config, queries, min(4, max(config.levels)), config.warmup)
+    if truth is not None:
+        print_quality(await measure_quality(config, queries, truth), len(truth[0]))
 
     results: list[LevelResult] = []
     for concurrency in config.levels:

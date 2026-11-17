@@ -7,8 +7,8 @@ use crate::{
     partition::partition,
     robustprune::{MAX_GRAPH_DEGREE, robust_prune},
     seeding::{SeedVecs, build_seed_list, encode_seed_vecs, read_seed_vec_from_bytes},
+    timing::{CpuClock, Phases},
 };
-use arrayvec::ArrayVec;
 use half::bf16;
 use rayon::prelude::*;
 
@@ -19,6 +19,7 @@ pub mod partition;
 pub mod robustprune;
 mod search;
 pub mod seeding;
+mod timing;
 mod types;
 
 pub use search::*;
@@ -35,7 +36,9 @@ pub type IndexBuildOutput = Result<
     String,
 >;
 
-pub fn build_index(vectors: Vec<SparseVector>, params: BuildParams) -> IndexBuildOutput {
+pub fn build_index(vectors: &[SparseVector], params: BuildParams) -> IndexBuildOutput {
+    let mut phases = Phases::new("build_index");
+
     let w = make_projection(params.vocab_size, params.m, params.seed);
     let sketches = vectors
         .par_iter()
@@ -52,6 +55,7 @@ pub fn build_index(vectors: Vec<SparseVector>, params: BuildParams) -> IndexBuil
         .collect::<Vec<Mutex<Reservoir>>>();
 
     let borrowed_vectors = vectors.iter().collect::<Vec<&SparseVector>>();
+    phases.mark("projection, sketches and reservoirs");
 
     let leaves = partition(
         &borrowed_vectors,
@@ -59,56 +63,81 @@ pub fn build_index(vectors: Vec<SparseVector>, params: BuildParams) -> IndexBuil
         0,
         params.seed,
     );
+    phases.mark("partition");
+    phases.note(|| {
+        let largest = leaves.iter().map(|l| l.len()).max().unwrap_or(0);
+        let memberships: usize = leaves.iter().map(|l| l.len()).sum();
+        format!(
+            "{} leaves, {memberships} memberships, largest leaf {largest} (its score matrix is {} MiB)",
+            leaves.len(),
+            largest * largest * 4 / (1 << 20),
+        )
+    });
+
+    // these add up the time of all threads, so they can exceed the wall time
+    let scoring_clock = CpuClock::default();
+    let insert_clock = CpuClock::default();
 
     leaves
         .par_iter()
         .map(|leaf| {
-            let mut scores = vec![0.0_f32; leaf.len() * leaf.len()];
-            let mut triples = Vec::with_capacity(leaf.len());
-            let edges = build_leaf_edges(
-                leaf,
-                params.leaf_k,
-                &mut scores,
-                &borrowed_vectors,
-                &mut triples,
-            );
-            for (src, dst, score) in edges {
-                let mut res = reservoirs[src as usize].lock().map_err(|e| e.to_string())?;
-                insert_in_reservoir(
-                    &mut res,
-                    src,
-                    dst,
-                    bf16::from_f32(score),
-                    &borrowed_sketches,
-                    params.m,
+            let edges = scoring_clock.time(|| {
+                let mut scores = vec![0.0_f32; leaf.len() * leaf.len()];
+                let mut triples = Vec::with_capacity(leaf.len());
+                build_leaf_edges(
+                    leaf,
+                    params.leaf_k,
+                    &mut scores,
+                    &borrowed_vectors,
+                    &mut triples,
                 )
-                .map_err(|e| e.to_string())?;
-                drop(res);
-            }
-
-            Ok(())
+            });
+            insert_clock.time(|| -> Result<(), String> {
+                for (src, dst, score) in edges {
+                    let mut res = reservoirs[src as usize].lock().map_err(|e| e.to_string())?;
+                    insert_in_reservoir(
+                        &mut res,
+                        src,
+                        dst,
+                        bf16::from_f32(score),
+                        &borrowed_sketches,
+                        params.m,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    drop(res);
+                }
+                Ok(())
+            })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    phases.mark("leaf scoring and reservoir inserts");
+    phases.note(|| {
+        format!(
+            "thread time, summed over all threads: leaf scoring {:.1}s, reservoir inserts {:.1}s",
+            scoring_clock.seconds(),
+            insert_clock.seconds()
+        )
+    });
 
-    let graph: Vec<u32> = (0..vectors.len())
-        .into_par_iter()
-        .map(|p| {
+    let mut graph = vec![0u32; vectors.len() * MAX_GRAPH_DEGREE];
+
+    graph
+        .par_chunks_mut(MAX_GRAPH_DEGREE)
+        .enumerate()
+        .try_for_each(|(p, row)| -> Result<(), String> {
             let candidates = reservoirs[p].lock().map_err(|e| e.to_string())?;
             let kept = robust_prune(
                 &candidates.slots,
                 params.robust_prune_alpha,
                 &borrowed_vectors,
             );
-
-            Ok(kept)
-        })
-        .collect::<Result<Vec<ArrayVec<u32, MAX_GRAPH_DEGREE>>, String>>()?
-        .iter()
-        .flatten()
-        .map(|v| *v)
-        .collect();
+            row.copy_from_slice(&kept); // panics if kept.len() != MAX_GRAPH_DEGREE
+            Ok(())
+        })?;
+    phases.mark("robust prune");
 
     let (seeds, term_max) = build_seed_list(&borrowed_vectors, params.entrypoint_seeds);
+    phases.mark("seed lists");
 
     let mut max_w = f32::MIN;
     borrowed_vectors
@@ -125,6 +154,7 @@ pub fn build_index(vectors: Vec<SparseVector>, params: BuildParams) -> IndexBuil
         .iter()
         .map(|v| make_routing_sketch(v, params.sketch_size, scale))
         .collect::<Result<Vec<QuantizedSparseVector>, String>>()?;
+    phases.mark("routing sketches");
 
     Ok((graph, seeds, term_max, routing_sketches, scale))
 }
@@ -136,14 +166,20 @@ pub fn save_vectors_and_sketches(
     dest_vectors: impl AsRef<Path>,
     dest_sketches: impl AsRef<Path>,
 ) -> io::Result<()> {
+    let mut phases = Phases::new("save_vectors_and_sketches");
     let vectors_encoded = encode_vectors(&vectors.iter().collect::<Vec<&SparseVector>>(), 4, None);
+    phases.mark("encode vectors");
     let sketches_encoded = encode_vectors(
         &sketches.iter().collect::<Vec<&QuantizedSparseVector>>(),
         1,
         Some(scale),
     );
+    phases.mark("encode sketches");
     fs::write(dest_vectors, vectors_encoded)?;
-    fs::write(dest_sketches, sketches_encoded)
+    phases.mark("write vectors");
+    let written = fs::write(dest_sketches, sketches_encoded);
+    phases.mark("write sketches");
+    written
 }
 
 pub fn read_sketches(src: impl AsRef<Path>) -> Result<VectorsAndSketches, String> {
@@ -163,6 +199,7 @@ pub fn save_index(
     term_max: BTreeMap<u32, f32>,
     dest: impl AsRef<Path>,
 ) -> io::Result<()> {
+    let mut phases = Phases::new("save_index");
     let encoded_seeds = encode_seed_vecs(&seeds);
     let lengths = &[graph.len() * 4, term_max.len() * 8, seeds.len()];
     let mut encoded: Vec<u8> = vec![];
@@ -181,8 +218,11 @@ pub fn save_index(
         encoded.extend_from_slice(&v.to_le_bytes());
     }
     encoded.extend_from_slice(&encoded_seeds);
+    phases.mark("encode graph, term max and seeds");
 
-    fs::write(dest, encoded)
+    let written = fs::write(dest, encoded);
+    phases.mark("write index");
+    written
 }
 
 pub fn read_index(src: impl AsRef<Path>) -> io::Result<IndexOutput> {

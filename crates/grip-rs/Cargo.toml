@@ -14,10 +14,13 @@ ordered-float = { version = "5.5.1", features = ["serde"] }
 num-traits = "0.2.19"
 memmap2 = { workspace = true }
 clap = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true }
 
 [features]
-default = []
+default = ["performance-timing"]
 cli = ["dep:clap"]
+# prints the time of each build phase and the peak memory to stderr
+performance-timing = ["dep:libc"]
 
 [[bin]]
 name = "grip-index"

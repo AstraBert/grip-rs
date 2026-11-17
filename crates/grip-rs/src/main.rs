@@ -177,7 +177,7 @@ fn run_build(args: BuildArgs) -> Result<(), Box<dyn Error>> {
 
     let t = Instant::now();
     // the vectors are cloned because `build_index` takes ownership of them
-    let (graph, seeds, term_max, sketches, scale) = build_index(vectors.clone(), params)?;
+    let (graph, seeds, term_max, sketches, scale) = build_index(&vectors, params)?;
     eprintln!("built the index in {:.1?}", t.elapsed());
 
     let t = Instant::now();
