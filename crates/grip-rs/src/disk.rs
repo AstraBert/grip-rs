@@ -1,3 +1,5 @@
+use std::io::{self, Write};
+
 use memmap2::Mmap;
 use num_traits::{FromBytes, ToBytes};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -6,56 +8,39 @@ use crate::types::Vector;
 
 pub const RAYON_THRESHOLD: usize = 100;
 
-pub fn encode_vectors<'a, T: ToBytes + FromBytes + 'a, V: Vector<'a, T>>(
+/// Writes the vectors in the on-disk format, one piece at a time.
+/// Pass a `BufWriter` so the data does not need to be held in memory first.
+pub fn write_vectors<'a, T: ToBytes + FromBytes + 'a, V: Vector<'a, T>>(
+    out: &mut impl Write,
     entries: &'a [&V],
     value_size: usize,
     scale: Option<f32>,
-) -> Vec<u8> {
+) -> io::Result<()> {
     let header_len = 4 + 8 + entries.len() * 8;
-    let body_len: usize = entries
-        .iter()
-        .map(|v| 2 + 2 + v.indices().len() * 4 + v.values().len() * value_size)
-        .sum();
-    let mut buf = Vec::with_capacity(header_len + body_len);
 
-    buf.extend_from_slice(
-        &u64::try_from(entries.len())
-            .expect("Should convert to u64")
-            .to_le_bytes(),
-    );
-
-    if let Some(sca) = scale {
-        buf.extend_from_slice(&sca.to_le_bytes());
-    } else {
-        buf.extend_from_slice(&[0_u8, 0_u8, 0_u8, 0_u8]);
-    }
+    out.write_all(&(entries.len() as u64).to_le_bytes())?;
+    out.write_all(&scale.unwrap_or(0.0).to_le_bytes())?;
 
     // 1) offset table
     let mut offset = header_len;
     for v in entries {
-        buf.extend_from_slice(
-            &u64::try_from(offset)
-                .expect("offset > u64::MAX")
-                .to_le_bytes(),
-        );
+        out.write_all(&(offset as u64).to_le_bytes())?;
         offset += 2 + v.indices().len() * 4 + v.values().len() * value_size;
     }
 
     // 2) entries
     for v in entries {
-        buf.extend_from_slice(
-            &u16::try_from(v.indices().len())
-                .expect("vec longer than u16::MAX")
-                .to_le_bytes(),
-        );
+        let len = u16::try_from(v.indices().len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "vec longer than u16::MAX"))?;
+        out.write_all(&len.to_le_bytes())?;
         for i in v.indices().iter() {
-            buf.extend_from_slice(&i.to_le_bytes());
+            out.write_all(&i.to_le_bytes())?;
         }
         for w in v.values().iter() {
-            buf.extend_from_slice(w.to_le_bytes().as_ref());
+            out.write_all(w.to_le_bytes().as_ref())?;
         }
     }
-    buf
+    Ok(())
 }
 
 pub fn decode_sparse_vectors_raw(

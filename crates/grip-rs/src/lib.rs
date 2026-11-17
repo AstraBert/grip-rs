@@ -1,7 +1,7 @@
-use std::{fs, io, path::Path, sync::Mutex};
+use std::{fs, io, io::Write, path::Path, sync::Mutex};
 
 use crate::{
-    disk::{decode_sparse_sketches, encode_vectors},
+    disk::{decode_sparse_sketches, write_vectors},
     hashprune::{Reservoir, insert_in_reservoir, make_projection, make_sketch},
     leaf::build_leaf_edges,
     partition::partition,
@@ -318,19 +318,25 @@ pub fn save_vectors_and_sketches(
     dest_sketches: impl AsRef<Path>,
 ) -> io::Result<()> {
     let mut phases = Phases::new("save_vectors_and_sketches");
-    let vectors_encoded = encode_vectors(&vectors.iter().collect::<Vec<&SparseVector>>(), 4, None);
-    phases.mark("encode vectors");
-    let sketches_encoded = encode_vectors(
+    let mut out = io::BufWriter::new(fs::File::create(dest_vectors)?);
+    write_vectors(
+        &mut out,
+        &vectors.iter().collect::<Vec<&SparseVector>>(),
+        4,
+        None,
+    )?;
+    out.flush()?;
+    phases.mark("write vectors");
+    let mut out = io::BufWriter::new(fs::File::create(dest_sketches)?);
+    write_vectors(
+        &mut out,
         &sketches.iter().collect::<Vec<&QuantizedSparseVector>>(),
         1,
         Some(scale),
-    );
-    phases.mark("encode sketches");
-    fs::write(dest_vectors, vectors_encoded)?;
-    phases.mark("write vectors");
-    let written = fs::write(dest_sketches, sketches_encoded);
+    )?;
+    out.flush()?;
     phases.mark("write sketches");
-    written
+    Ok(())
 }
 
 pub fn read_sketches(src: impl AsRef<Path>) -> Result<VectorsAndSketches, String> {
