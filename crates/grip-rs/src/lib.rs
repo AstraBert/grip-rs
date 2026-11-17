@@ -39,6 +39,7 @@ pub type IndexBuildOutput = Result<
 struct Scratch {
     visited: Visited,
     dense: Vec<u8>,
+    dense_prune: Vec<f32>,
 }
 
 impl Scratch {
@@ -49,6 +50,7 @@ impl Scratch {
                 visited: vec![0_u32; n_docs],
             },
             dense: vec![0_u8; vocab_size],
+            dense_prune: vec![0_f32; vocab_size],
         }
     }
 }
@@ -154,9 +156,10 @@ fn refine(
                     })
                     .collect::<Vec<(u32, f32)>>();
                 let pruned = robust_prune::<f32>(
-                    &exact_scores,
+                    exact_scores,
                     params.robust_prune_alpha,
                     &borrowed_vectors,
+                    &mut scratch.dense_prune,
                 );
                 row.copy_from_slice(&pruned);
                 Ok(())
@@ -255,16 +258,20 @@ pub fn build_index(vectors: &[SparseVector], params: BuildParams) -> IndexBuildO
     graph
         .par_chunks_mut(MAX_GRAPH_DEGREE)
         .enumerate()
-        .try_for_each(|(p, row)| -> Result<(), String> {
-            let candidates = reservoirs[p].lock().map_err(|e| e.to_string())?;
-            let kept = robust_prune::<half::bf16>(
-                &candidates.slots.iter().map(|s| (s.id, s.score)).collect(),
-                params.robust_prune_alpha,
-                &borrowed_vectors,
-            );
-            row.copy_from_slice(&kept); // panics if kept.len() != MAX_GRAPH_DEGREE
-            Ok(())
-        })?;
+        .try_for_each_init(
+            || vec![0_f32; params.vocab_size],
+            |dense, (p, row)| -> Result<(), String> {
+                let candidates = reservoirs[p].lock().map_err(|e| e.to_string())?;
+                let kept = robust_prune::<half::bf16>(
+                    candidates.slots.iter().map(|s| (s.id, s.score)).collect(),
+                    params.robust_prune_alpha,
+                    &borrowed_vectors,
+                    dense,
+                );
+                row.copy_from_slice(&kept); // panics if kept.len() != MAX_GRAPH_DEGREE
+                Ok(())
+            },
+        )?;
     phases.mark("robust prune");
 
     let (seeds, term_max) = build_seed_list(&borrowed_vectors, params.entrypoint_seeds);

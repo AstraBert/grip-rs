@@ -32,11 +32,12 @@ impl AsF32 for half::bf16 {
 }
 
 pub fn robust_prune<T: AsF32 + Clone>(
-    candidates: &Vec<(u32, T)>,
+    candidates: Vec<(u32, T)>,
     alpha: f32,
     vectors: &[&SparseVector],
+    dense: &mut [f32],
 ) -> ArrayVec<u32, MAX_GRAPH_DEGREE> {
-    let mut cand = candidates.clone();
+    let mut cand = candidates;
     // sort in reverse
     cand.sort_by(|a, b| a.1.safe_compare(&b.1));
     let mut kept = ArrayVec::new();
@@ -49,24 +50,25 @@ pub fn robust_prune<T: AsF32 + Clone>(
         if cand.is_empty() {
             break;
         }
-        let mut i = (cand.len() - 1) as isize;
-        let mut to_remove = vec![];
-        // we iter backwards so that
-        // we go from best -> worst
-        // candidate
-        while i >= 0 {
-            let dot = vectors[q.0 as usize].dot(vectors[cand[i as usize].0 as usize]);
-            if dot > alpha * cand[i as usize].1.as_f32() {
-                to_remove.push(i as usize);
-            }
-            i -= 1;
-        }
-        to_remove
+        for (t, w) in vectors[q.0 as usize]
+            .indices
             .iter()
-            .map(|u| {
-                let _ = cand.remove(*u);
-            })
-            .for_each(drop);
+            .zip(vectors[q.0 as usize].values.iter())
+        {
+            dense[*t as usize] = *w;
+        }
+        cand.retain(|c| {
+            let vector = vectors[c.0 as usize];
+            let mut dot = 0_f32;
+            for (t, w) in vector.indices.iter().zip(vector.values.iter()) {
+                dot += dense[*t as usize] * *w;
+            }
+            dot <= alpha * c.1.as_f32()
+        });
+
+        for t in vectors[q.0 as usize].indices.iter() {
+            dense[*t as usize] = 0.0;
+        }
     }
 
     while kept.len() < MAX_GRAPH_DEGREE {
