@@ -158,7 +158,13 @@ pub fn partition(
         .map(|(gid, g)| {
             let sub_vectors: Vec<&SparseVector> = g.iter().map(|&p| vectors[p as usize]).collect();
             let sub_ids: Vec<u32> = g.iter().map(|&p| ids[p as usize]).collect();
-            partition(&sub_vectors, &sub_ids, depth + 1, seed + gid as u64, fanouts)
+            partition(
+                &sub_vectors,
+                &sub_ids,
+                depth + 1,
+                seed + gid as u64,
+                fanouts,
+            )
         })
         .collect::<Vec<Vec<Vec<u32>>>>()
         .into_iter()

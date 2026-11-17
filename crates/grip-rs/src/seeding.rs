@@ -1,57 +1,42 @@
-use std::{
-    cmp::Reverse,
-    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
-};
+use std::{cmp::Reverse, collections::BinaryHeap};
 
 use crate::types::SparseVector;
 use ordered_float::OrderedFloat;
 
-pub type SeedHeaps = HashMap<u32, BinaryHeap<(Reverse<OrderedFloat<f32>>, u32)>>;
-pub type SeedVecs = BTreeMap<u32, Vec<(f32, u32)>>;
+pub type SeedHeaps = Vec<BinaryHeap<(Reverse<OrderedFloat<f32>>, u32)>>;
+pub type SeedVecs = Vec<Vec<(f32, u32)>>;
 
-pub fn build_seed_list(vectors: &[&SparseVector], size: usize) -> (SeedVecs, BTreeMap<u32, f32>) {
-    let mut seed_heaps: SeedHeaps = HashMap::new();
-    let mut term_max: BTreeMap<u32, f32> = BTreeMap::new();
-
-    let mut all_terms: HashSet<u32> = HashSet::new();
-
-    for v in vectors.iter() {
-        for t in v.indices.iter() {
-            all_terms.insert(*t);
-        }
-    }
-
-    for t in all_terms {
-        seed_heaps.insert(t, BinaryHeap::new());
-        term_max.insert(t, 0_f32);
-    }
+pub fn build_seed_list(
+    vectors: &[&SparseVector],
+    size: usize,
+    vocab_size: usize,
+) -> (SeedVecs, Vec<f32>) {
+    let mut seed_heaps: SeedHeaps = vec![BinaryHeap::new(); vocab_size];
+    let mut term_max: Vec<f32> = vec![0.0; vocab_size];
 
     for d in 0..vectors.len() {
         for (t, w) in vectors[d].indices.iter().zip(vectors[d].values.iter()) {
-            term_max
-                .entry(*t)
-                .and_modify(|e| *e = e.max(*w))
-                .or_insert(*w);
-            if let Some(heap) = seed_heaps.get_mut(t) {
-                if heap.len() < size {
-                    heap.push((Reverse(OrderedFloat(*w)), d as u32));
-                } else if OrderedFloat(*w) > heap.peek().unwrap().0.0 {
-                    heap.pop();
-                    heap.push((Reverse(OrderedFloat(*w)), d as u32));
-                }
+            if *w > term_max[*t as usize] {
+                term_max[*t as usize] = *w;
+            }
+            // we populated all the terms in the vocabulary,
+            // so this must be not-none
+            let heap = seed_heaps.get_mut(*t as usize).unwrap();
+            if heap.len() < size {
+                heap.push((Reverse(OrderedFloat(*w)), d as u32));
+            } else if OrderedFloat(*w) > heap.peek().unwrap().0.0 {
+                heap.pop();
+                heap.push((Reverse(OrderedFloat(*w)), d as u32));
             }
         }
     }
 
     let seed_vecs: SeedVecs = seed_heaps
         .iter()
-        .map(|(k, v)| {
-            (
-                *k,
-                v.iter()
-                    .map(|f| (f.0.0.into_inner(), f.1 as u32))
-                    .collect::<Vec<(f32, u32)>>(),
-            )
+        .map(|v| {
+            v.iter()
+                .map(|f| (f.0.0.into_inner(), f.1 as u32))
+                .collect::<Vec<(f32, u32)>>()
         })
         .collect();
 
@@ -60,12 +45,12 @@ pub fn build_seed_list(vectors: &[&SparseVector], size: usize) -> (SeedVecs, BTr
 
 pub fn encode_seed_vecs(entries: &SeedVecs) -> Vec<u8> {
     let header_len = entries.len() * 4;
-    let body_len: usize = entries.iter().map(|(_, v)| 4 + 2 + v.len() * 8).sum();
+    let body_len: usize = entries.iter().map(|v| 4 + 2 + v.len() * 8).sum();
     let mut buf = Vec::with_capacity(header_len + body_len);
 
     // 1) offset table
     let mut offset = header_len;
-    for (_, v) in entries {
+    for v in entries {
         buf.extend_from_slice(
             &u32::try_from(offset)
                 .expect("offset > u32::MAX")
@@ -75,8 +60,12 @@ pub fn encode_seed_vecs(entries: &SeedVecs) -> Vec<u8> {
     }
 
     // 2) entries
-    for (key, v) in entries {
-        buf.extend_from_slice(&key.to_le_bytes());
+    for (key, v) in entries.iter().enumerate() {
+        buf.extend_from_slice(
+            &u32::try_from(key)
+                .expect("Should convert to u32")
+                .to_le_bytes(),
+        );
         buf.extend_from_slice(
             &u16::try_from(v.len())
                 .expect("vec longer than u16::MAX")

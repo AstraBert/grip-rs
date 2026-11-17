@@ -1,7 +1,4 @@
-use std::{
-    cmp::Reverse,
-    collections::{BTreeMap, BinaryHeap},
-};
+use std::{cmp::Reverse, collections::BinaryHeap};
 
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
@@ -39,11 +36,11 @@ impl VectorsAndSketches {
 pub struct IndexOutput {
     pub graph: Vec<u32>,
     pub seeds: SeedVecs,
-    pub term_max: BTreeMap<u32, f32>,
+    pub term_max: Vec<f32>,
 }
 
 impl IndexOutput {
-    pub fn new(graph: Vec<u32>, seeds: SeedVecs, term_max: BTreeMap<u32, f32>) -> Self {
+    pub fn new(graph: Vec<u32>, seeds: SeedVecs, term_max: Vec<f32>) -> Self {
         Self {
             graph,
             seeds,
@@ -92,18 +89,18 @@ fn maybe_add_result(
 pub fn compute_entry_points(
     by_impact: &mut QuantizedSparseVector,
     seeds: &SeedVecs,
-    term_max: &BTreeMap<u32, f32>,
+    term_max: &[f32],
     max_query_dims: usize,
 ) -> Vec<u32> {
     by_impact.sort_with_fn(|el_a: (u32, u8), el_b: (u32, u8)| {
-        let max_weigth_a = term_max.get(&el_a.0).unwrap_or(&0_f32);
-        let max_weigth_b = term_max.get(&el_b.0).unwrap_or(&0_f32);
+        let max_weigth_a = term_max.get(el_a.0 as usize).unwrap_or(&0_f32);
+        let max_weigth_b = term_max.get(el_b.0 as usize).unwrap_or(&0_f32);
         (el_b.1 as f32 * *max_weigth_b).total_cmp(&(*max_weigth_a * el_a.1 as f32))
     });
     by_impact.truncate(max_query_dims);
     let mut entry_points = vec![];
     for t in by_impact.indices.iter() {
-        let seeds = seeds.get(t);
+        let seeds = seeds.get(*t as usize);
         if let Some(sds) = seeds {
             for s in sds {
                 entry_points.push(s.1);

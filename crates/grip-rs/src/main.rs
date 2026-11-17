@@ -216,7 +216,7 @@ fn run_build(args: BuildArgs) -> Result<(), Box<dyn Error>> {
 }
 
 fn run_search(args: SearchArgs) -> Result<(), Box<dyn Error>> {
-    let index = read_index(args.index_dir.join(INDEX_FILE))?;
+    let index = read_index(args.index_dir.join(INDEX_FILE), args.vocab_size)?;
     let vectors_and_sketches = read_sketches(args.index_dir.join(SKETCHES_FILE))?;
 
     let vectors_file = File::open(args.index_dir.join(VECTORS_FILE))?;

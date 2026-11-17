@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs, io, path::Path, sync::Mutex};
+use std::{fs, io, path::Path, sync::Mutex};
 
 use crate::{
     disk::{decode_sparse_sketches, encode_vectors},
@@ -29,7 +29,7 @@ pub type IndexBuildOutput = Result<
     (
         Vec<u32>,
         SeedVecs,
-        BTreeMap<u32, f32>,
+        Vec<f32>,
         Vec<QuantizedSparseVector>,
         f32,
     ),
@@ -60,7 +60,7 @@ fn refine(
     vectors: &[SparseVector],
     sketches: &[QuantizedSparseVector],
     seeds: &SeedVecs,
-    term_max: &BTreeMap<u32, f32>,
+    term_max: &Vec<f32>,
     params: &BuildParams,
     scale: f32,
 ) -> Result<Vec<u32>, String> {
@@ -274,22 +274,21 @@ pub fn build_index(vectors: &[SparseVector], params: BuildParams) -> IndexBuildO
         )?;
     phases.mark("robust prune");
 
-    let (seeds, term_max) = build_seed_list(&borrowed_vectors, params.entrypoint_seeds);
+    let (seeds, term_max) = build_seed_list(
+        &borrowed_vectors,
+        params.entrypoint_seeds,
+        params.vocab_size,
+    );
     phases.mark("seed lists");
 
-    let mut max_w = f32::MIN;
-    borrowed_vectors
-        .iter()
-        .map(|v| {
-            for w in v.values.iter() {
-                max_w = max_w.max(*w);
-            }
-        })
-        .for_each(drop);
+    let max_w = borrowed_vectors
+        .par_iter()
+        .map(|v| v.values.iter().copied().fold(f32::MIN, f32::max))
+        .reduce(|| f32::MIN, f32::max);
     let scale = max_w / 255_f32;
 
     let routing_sketches = borrowed_vectors
-        .iter()
+        .par_iter()
         .map(|v| make_routing_sketch(v, params.sketch_size, scale))
         .collect::<Result<Vec<QuantizedSparseVector>, String>>()?;
     phases.mark("routing sketches");
@@ -348,7 +347,7 @@ pub fn read_sketches(src: impl AsRef<Path>) -> Result<VectorsAndSketches, String
 pub fn save_index(
     graph: Vec<u32>,
     seeds: SeedVecs,
-    term_max: BTreeMap<u32, f32>,
+    term_max: Vec<f32>,
     dest: impl AsRef<Path>,
 ) -> io::Result<()> {
     let mut phases = Phases::new("save_index");
@@ -365,8 +364,12 @@ pub fn save_index(
     for g in graph {
         encoded.extend_from_slice(&g.to_le_bytes());
     }
-    for (k, v) in term_max {
-        encoded.extend_from_slice(&k.to_le_bytes());
+    for (k, v) in term_max.iter().enumerate() {
+        encoded.extend_from_slice(
+            &u32::try_from(k)
+                .expect("Should convert to u32")
+                .to_le_bytes(),
+        );
         encoded.extend_from_slice(&v.to_le_bytes());
     }
     encoded.extend_from_slice(&encoded_seeds);
@@ -377,7 +380,7 @@ pub fn save_index(
     written
 }
 
-pub fn read_index(src: impl AsRef<Path>) -> io::Result<IndexOutput> {
+pub fn read_index(src: impl AsRef<Path>, vocab_size: usize) -> io::Result<IndexOutput> {
     let content = fs::read(src)?;
 
     let lengths = &[
@@ -395,7 +398,7 @@ pub fn read_index(src: impl AsRef<Path>) -> io::Result<IndexOutput> {
     ];
 
     let graph_bytes = &content[24..24 + lengths[0] as usize];
-    let mut graph: Vec<u32> = vec![];
+    let mut graph: Vec<u32> = Vec::with_capacity(vocab_size);
 
     for b in graph_bytes.chunks_exact(4) {
         graph.push(u32::from_le_bytes(
@@ -405,22 +408,22 @@ pub fn read_index(src: impl AsRef<Path>) -> io::Result<IndexOutput> {
 
     let term_max_bytes =
         &content[24 + lengths[0] as usize..24 + lengths[0] as usize + lengths[1] as usize];
-    let mut term_max: BTreeMap<u32, f32> = BTreeMap::new();
+    let mut term_max: Vec<f32> = vec![0_f32; vocab_size];
 
     for be in term_max_bytes.chunks_exact(8) {
         let k = &be[0..4];
         let v = &be[4..8];
         let ku = u32::from_le_bytes(k.try_into().expect("Should convert to [u8; 4]"));
         let vf = f32::from_le_bytes(v.try_into().expect("Should convert to [u8; 4]"));
-        term_max.insert(ku, vf);
+        term_max[ku as usize] = vf;
     }
 
     let seeds_bytes = &content[24 + lengths[0] as usize + lengths[1] as usize..];
-    let mut seeds: SeedVecs = BTreeMap::new();
+    let mut seeds: SeedVecs = vec![vec![]; vocab_size];
 
     for i in 0..lengths[2] {
         let (k, v) = read_seed_vec_from_bytes(seeds_bytes, i as usize);
-        seeds.insert(k, v);
+        seeds[k as usize] = v;
     }
 
     Ok(IndexOutput::new(graph, seeds, term_max))

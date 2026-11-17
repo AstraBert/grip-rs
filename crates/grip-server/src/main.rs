@@ -367,7 +367,8 @@ async fn post_search(
 async fn main() -> Result<(), String> {
     let args = Args::parse();
 
-    let index = read_index(args.index_dir.join(INDEX_FILE)).map_err(|e| e.to_string())?;
+    let index =
+        read_index(args.index_dir.join(INDEX_FILE), args.vocab_size).map_err(|e| e.to_string())?;
     let vectors_and_sketches = read_sketches(args.index_dir.join(SKETCHES_FILE))?;
 
     let vectors_file = File::open(args.index_dir.join(VECTORS_FILE)).map_err(|e| e.to_string())?;
