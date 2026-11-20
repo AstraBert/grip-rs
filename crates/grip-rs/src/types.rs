@@ -298,6 +298,23 @@ pub struct BuildParams {
 }
 
 impl BuildParams {
+    pub fn from_defaults(vocab_size: usize) -> Self {
+        Self {
+            vocab_size,
+            m: 12,
+            seed: 42,
+            leaf_k: 8,
+            refine: true,
+            robust_prune_alpha: 1.0,
+            entrypoint_seeds: 64,
+            sketch_size: 80,
+            fanouts: [3, 2],
+            refinement_ef: Some(100),
+            refinement_patience: Some(20),
+            refinement_query_dims: Some(2),
+        }
+    }
+
     pub fn new(
         m: usize,
         seed: u64,
@@ -369,6 +386,18 @@ pub struct SearchParams {
     pub top_k: usize,
     pub ef: usize,
     pub rescore_factor: usize,
+}
+
+impl Default for SearchParams {
+    fn default() -> Self {
+        Self {
+            max_query_dims: 2,
+            patience: 20,
+            top_k: 10,
+            rescore_factor: 5,
+            ef: 100,
+        }
+    }
 }
 
 impl SearchParams {

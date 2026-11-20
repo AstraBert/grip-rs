@@ -2,6 +2,7 @@ use std::{
     error::Error,
     fmt::Display,
     fs::File,
+    io,
     path::PathBuf,
     str::FromStr,
     sync::{Arc, Mutex},
@@ -16,6 +17,7 @@ use clap::Parser;
 use grip_rs::{
     IndexOutput, SearchParams, SparseVector, VectorsAndSketches, Visited, read_index,
     read_sketches, search,
+    tombstone::{Tombstones, delete as tombstone_deletion, load_tombstones},
 };
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
@@ -72,6 +74,8 @@ struct ServerState {
     sketches: VectorsAndSketches,
     vocab_size: usize,
     scratch: Mutex<Vec<Scratch>>,
+    tombstones: Tombstones,
+    log_dir: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +129,7 @@ struct GripInfo {
     vocab_size: usize,
     num_documents: usize,
     scale: f32,
+    deleted_ratio: f64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -245,6 +250,7 @@ async fn get_info(data: web::Data<ServerState>) -> impl Responder {
         vocab_size: data.vocab_size,
         num_documents: data.sketches.offsets.len() - 1,
         scale: data.sketches.scale,
+        deleted_ratio: data.tombstones.ratio(data.sketches.offsets.len() - 1),
     }
 }
 
@@ -331,7 +337,7 @@ async fn post_search(
         &request.vector,
         &data.sketches,
         &data.index_output,
-        SearchParams {
+        &SearchParams {
             patience: request.patience.unwrap(),
             top_k: request.top_k.unwrap(),
             rescore_factor: request.rescore_factor.unwrap(),
@@ -342,6 +348,7 @@ async fn post_search(
         &mut pad.dense,
         &mut pad.dense_rescoring,
         &data.mmap,
+        &data.tombstones,
     )
     .map_err(|e| SearchError::CoreSearchError(e))?;
 
@@ -361,6 +368,63 @@ async fn post_search(
         search_time: duration,
         total_time: total_start.elapsed().as_secs_f32() * 1000_f32,
     })
+}
+
+#[derive(Debug)]
+pub enum DeletionError {
+    NotFound,
+    IOError(String),
+}
+
+impl Display for DeletionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "Point not found in the collection"),
+            Self::IOError(s) => write!(f, "IO Error when deleting: {}", s),
+        }
+    }
+}
+
+impl Error for DeletionError {}
+
+impl ResponseError for DeletionError {
+    fn error_response(&self) -> HttpResponse<BoxBody> {
+        HttpResponse::build(self.status_code())
+            .insert_header(ContentType::plaintext())
+            .body(self.to_string())
+    }
+
+    fn status_code(&self) -> actix_web::http::StatusCode {
+        match self {
+            Self::NotFound => actix_web::http::StatusCode::NOT_FOUND,
+            Self::IOError(_) => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+async fn delete_point(
+    path: web::Path<u32>,
+    data: web::Data<ServerState>,
+) -> Result<HttpResponse, DeletionError> {
+    let res = tombstone_deletion(
+        path.into_inner(),
+        &data.tombstones,
+        &data.log_dir,
+        data.sketches.offsets.len() - 1,
+    );
+    match res {
+        Err(e) => match e.kind() {
+            io::ErrorKind::NotFound => return Err(DeletionError::NotFound),
+            _ => return Err(DeletionError::IOError(e.to_string())),
+        },
+        Ok(d) => {
+            if !d {
+                return Ok(HttpResponse::NoContent().finish());
+            }
+        }
+    }
+
+    Ok(HttpResponse::Accepted().finish())
 }
 
 #[actix_web::main]
@@ -383,12 +447,17 @@ async fn main() -> Result<(), String> {
         ));
     }
 
+    let tombstones = Tombstones::with_capacity(index.graph.len() / 64);
+    load_tombstones(&tombstones, &args.index_dir).map_err(|e| e.to_string())?;
+
     let state = web::Data::new(ServerState {
         mmap: Arc::new(mmap),
         index_output: index,
         sketches: vectors_and_sketches,
         vocab_size: args.vocab_size,
         scratch: Mutex::new(scratches),
+        tombstones,
+        log_dir: args.index_dir.clone(),
     });
 
     env_logger::init_from_env(
@@ -402,6 +471,7 @@ async fn main() -> Result<(), String> {
             .route("/health", web::get().to(HttpResponse::Ok))
             .route("/info", web::get().to(get_info))
             .route("/search", web::post().to(post_search))
+            .route("/points/{id}", web::delete().to(delete_point))
     })
     .workers(args.num_workers)
     .bind((args.host.as_deref().unwrap_or("localhost"), args.port))
