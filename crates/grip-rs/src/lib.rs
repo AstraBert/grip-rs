@@ -13,6 +13,7 @@ use crate::{
 use half::bf16;
 use rayon::prelude::*;
 
+pub mod delta;
 pub mod disk;
 pub mod hashprune;
 pub mod leaf;
