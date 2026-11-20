@@ -9,9 +9,12 @@ use std::{
 
 use clap::{Args, Parser, Subcommand};
 use grip_rs::{
-    BuildParams, SearchParams, SparseVector, Visited, build_index, disk::decode_sparse_vectors_raw,
-    read_index, read_sketches, robustprune::MAX_GRAPH_DEGREE, save_index,
-    save_vectors_and_sketches, search,
+    BuildParams, SearchParams, SparseVector, Visited, build_index,
+    disk::decode_sparse_vectors_raw,
+    read_index, read_sketches,
+    robustprune::MAX_GRAPH_DEGREE,
+    save_index, save_vectors_and_sketches, search,
+    tombstone::{Tombstones, delete, load_tombstones},
 };
 use memmap2::Mmap;
 
@@ -35,6 +38,8 @@ enum Command {
     Build(BuildArgs),
     /// Search an index with a set of queries
     Search(SearchArgs),
+    /// Mark documents of an index as deleted
+    Delete(DeleteArgs),
 }
 
 #[derive(Args)]
@@ -124,6 +129,16 @@ struct SearchArgs {
     /// For rescoring against full-precision vectors, consider top_k x rescore_factor candidates.
     #[arg(long, default_value_t = 5)]
     rescore_factor: usize,
+}
+
+#[derive(Args)]
+struct DeleteArgs {
+    /// Directory that holds the index files written by `build`
+    #[arg(long)]
+    index_dir: PathBuf,
+    /// Ids of the documents to delete, separated by commas
+    #[arg(long, required = true, value_delimiter = ',')]
+    ids: Vec<u32>,
 }
 
 fn read_u32(reader: &mut impl Read) -> Result<u32, String> {
@@ -223,6 +238,9 @@ fn run_search(args: SearchArgs) -> Result<(), Box<dyn Error>> {
     // Safety: the vectors file must not change while it is mapped
     let mmap = unsafe { Mmap::map(&vectors_file)? };
 
+    let tombestones = Tombstones::with_capacity(index.graph.len() / MAX_GRAPH_DEGREE);
+    load_tombstones(&tombestones, &args.index_dir)?;
+
     let queries = read_seismic_bin(&args.queries, args.n_queries)?;
     if queries.is_empty() {
         return Err("there are no queries to run".into());
@@ -255,11 +273,12 @@ fn run_search(args: SearchArgs) -> Result<(), Box<dyn Error>> {
             q,
             &vectors_and_sketches,
             &index,
-            make_params()?,
+            &make_params()?,
             &mut visited,
             &mut dense,
             &mut dense_rescoring,
             &mmap,
+            &tombestones,
         )?);
     }
     let elapsed = t.elapsed();
@@ -297,6 +316,7 @@ fn run_search(args: SearchArgs) -> Result<(), Box<dyn Error>> {
             let mut exact: Vec<(f32, u32)> = docs
                 .iter()
                 .enumerate()
+                .filter(|(i, _)| !tombestones.is_deleted(*i as u32))
                 .map(|(i, d)| (q.dot(d), i as u32))
                 .collect();
             if exact.len() > k {
@@ -319,9 +339,50 @@ fn run_search(args: SearchArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Reads the number of documents from the header of the vectors file.
+fn count_documents(index_dir: &Path) -> Result<usize, String> {
+    let path = index_dir.join(VECTORS_FILE);
+    let mut file = File::open(&path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let mut buf = [0_u8; 8];
+    file.read_exact(&mut buf)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    Ok(u64::from_le_bytes(buf) as usize)
+}
+
+fn run_delete(args: DeleteArgs) -> Result<(), Box<dyn Error>> {
+    let n_docs = count_documents(&args.index_dir)?;
+    // check every id first, so a bad id does not leave a half-applied deletion
+    if let Some(id) = args.ids.iter().find(|&&id| id as usize >= n_docs) {
+        return Err(
+            format!("document id {id} is out of range: the index has {n_docs} documents").into(),
+        );
+    }
+
+    let tombstones = Tombstones::with_capacity(n_docs);
+    load_tombstones(&tombstones, &args.index_dir)?;
+
+    let (mut deleted, mut already_deleted) = (0, 0);
+    for id in &args.ids {
+        match delete(*id, &tombstones, &args.index_dir, n_docs) {
+            Ok(b) => {
+                if b {
+                    deleted += 1
+                } else {
+                    already_deleted += 1
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    eprintln!("deleted {deleted} documents ({already_deleted} were already deleted)");
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     match Cli::parse().command {
         Command::Build(args) => run_build(args),
         Command::Search(args) => run_search(args),
+        Command::Delete(args) => run_delete(args),
     }
 }
