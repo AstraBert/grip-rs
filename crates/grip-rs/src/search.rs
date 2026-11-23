@@ -4,6 +4,7 @@ use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    delta::{Delta, delta_search},
     disk::decode_sparse_vectors_raw,
     seeding::SeedVecs,
     tombstone::Tombstones,
@@ -280,4 +281,43 @@ pub fn search(
         dense_rescoring,
         &params,
     )
+}
+
+pub fn search_all(
+    query: &SparseVector,
+    vectors_and_sketches: &VectorsAndSketches,
+    index_output: &IndexOutput,
+    params: &SearchParams,
+    visited: &mut Visited,
+    dense: &mut Vec<u8>,
+    dense_rescoring: &mut Vec<f32>,
+    sparse_vectors_mmap: &Mmap,
+    tombstones: &Tombstones,
+    delta_base: u32,
+    delta: &Delta,
+    delta_acc: &mut Vec<f32>,
+) -> Result<Vec<(u32, f32)>, String> {
+    let mut hits = search(
+        query,
+        vectors_and_sketches,
+        index_output,
+        params,
+        visited,
+        dense,
+        dense_rescoring,
+        sparse_vectors_mmap,
+        tombstones,
+    )?;
+    let mut delta_hits = delta_search(
+        delta,
+        query,
+        params.top_k,
+        tombstones,
+        delta_base,
+        delta_acc,
+    );
+    hits.append(&mut delta_hits);
+    hits.sort_by(|a, b| b.1.total_cmp(&a.1));
+    hits.truncate(params.top_k);
+    Ok(hits)
 }

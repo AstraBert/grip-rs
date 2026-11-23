@@ -5,18 +5,21 @@ use std::{
     io,
     path::PathBuf,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::Instant,
 };
 
 use actix_web::{
-    App, HttpResponse, HttpServer, Responder, ResponseError, body::BoxBody,
-    http::header::ContentType, web,
+    App, HttpResponse, HttpServer, Responder, ResponseError,
+    body::BoxBody,
+    http::header::ContentType,
+    web::{self, Json},
 };
 use clap::Parser;
 use grip_rs::{
-    IndexOutput, SearchParams, SparseVector, VectorsAndSketches, Visited, read_index,
-    read_sketches, search,
+    IndexOutput, SearchParams, SparseVector, VectorsAndSketches, Visited,
+    delta::{Delta, DeltaError, MAX_DELTA, load_delta, persist_delta_insert},
+    read_index, read_sketches, search_all,
     tombstone::{Tombstones, delete as tombstone_deletion, load_tombstones},
 };
 use memmap2::Mmap;
@@ -76,12 +79,14 @@ struct ServerState {
     scratch: Mutex<Vec<Scratch>>,
     tombstones: Tombstones,
     log_dir: PathBuf,
+    delta: RwLock<Delta>,
 }
 
 #[derive(Debug, Clone)]
 struct Scratch {
     dense: Vec<u8>,
     dense_rescoring: Vec<f32>,
+    delta_acc: Vec<f32>,
     visited: Visited,
 }
 
@@ -94,6 +99,7 @@ impl Scratch {
                 counter: 0,
                 visited: vec![0; n_docs],
             },
+            delta_acc: vec![0.0; MAX_DELTA],
         }
     }
 }
@@ -245,13 +251,21 @@ impl Responder for SearchResponse {
     }
 }
 
-async fn get_info(data: web::Data<ServerState>) -> impl Responder {
-    GripInfo {
+type InfoError = UpdateError;
+
+async fn get_info(data: web::Data<ServerState>) -> Result<GripInfo, InfoError> {
+    let delta_m = data.delta.read().map_err(|_| InfoError::Mutex)?;
+    let n_docs = delta_m.docs.len();
+    drop(delta_m);
+
+    Ok(GripInfo {
         vocab_size: data.vocab_size,
-        num_documents: data.sketches.offsets.len() - 1,
+        num_documents: data.sketches.offsets.len() + n_docs - 1,
         scale: data.sketches.scale,
-        deleted_ratio: data.tombstones.ratio(data.sketches.offsets.len() - 1),
-    }
+        deleted_ratio: data
+            .tombstones
+            .ratio(data.sketches.offsets.len() + n_docs - 1),
+    })
 }
 
 #[derive(Debug)]
@@ -332,8 +346,10 @@ async fn post_search(
 
     drop(scratch);
 
+    let delta_m = data.delta.read().map_err(|_| SearchError::MutexError)?;
+
     let start = Instant::now();
-    let results = search(
+    let results = search_all(
         &request.vector,
         &data.sketches,
         &data.index_output,
@@ -349,8 +365,13 @@ async fn post_search(
         &mut pad.dense_rescoring,
         &data.mmap,
         &data.tombstones,
+        (data.sketches.offsets.len() - 1) as u32,
+        &delta_m,
+        &mut pad.delta_acc,
     )
     .map_err(|e| SearchError::CoreSearchError(e))?;
+
+    drop(delta_m);
 
     let duration = start.elapsed().as_secs_f32() * 1000_f32;
 
@@ -374,6 +395,7 @@ async fn post_search(
 pub enum DeletionError {
     NotFound,
     IOError(String),
+    MutexError,
 }
 
 impl Display for DeletionError {
@@ -381,6 +403,7 @@ impl Display for DeletionError {
         match self {
             Self::NotFound => write!(f, "Point not found in the collection"),
             Self::IOError(s) => write!(f, "IO Error when deleting: {}", s),
+            Self::MutexError => write!(f, "Mutext holding delta is poisoned"),
         }
     }
 }
@@ -398,6 +421,7 @@ impl ResponseError for DeletionError {
         match self {
             Self::NotFound => actix_web::http::StatusCode::NOT_FOUND,
             Self::IOError(_) => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Self::MutexError => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
@@ -406,11 +430,14 @@ async fn delete_point(
     path: web::Path<u32>,
     data: web::Data<ServerState>,
 ) -> Result<HttpResponse, DeletionError> {
+    let delta_m = data.delta.read().map_err(|_| DeletionError::MutexError)?;
+    let n_docs = delta_m.docs.len();
+    drop(delta_m);
     let res = tombstone_deletion(
         path.into_inner(),
         &data.tombstones,
         &data.log_dir,
-        data.sketches.offsets.len() - 1,
+        data.sketches.offsets.len() + n_docs - 1,
     );
     match res {
         Err(e) => match e.kind() {
@@ -425,6 +452,108 @@ async fn delete_point(
     }
 
     Ok(HttpResponse::Accepted().finish())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct UpdateRequest {
+    indices: Vec<u32>,
+    values: Vec<f32>,
+}
+
+#[derive(Debug)]
+enum UpdateError {
+    Validation(String),
+    IsFull,
+    IO(String),
+    Mutex,
+}
+
+impl Display for UpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Validation(e) => write!(f, "Validation error: {}", e),
+            Self::IsFull => write!(f, "Delta is full"),
+            Self::IO(e) => write!(f, "IO error: {}", e),
+            Self::Mutex => write!(f, "Mutex holding the delta is poisoned"),
+        }
+    }
+}
+
+impl Error for UpdateError {}
+
+#[derive(Debug, Serialize)]
+struct UpdateResponse {
+    external_id: u32,
+}
+
+impl Responder for UpdateResponse {
+    type Body = BoxBody;
+
+    fn respond_to(self, _req: &actix_web::HttpRequest) -> HttpResponse<Self::Body> {
+        let body = serde_json::to_string(&self).unwrap();
+
+        // Create response and set content type
+        HttpResponse::Created()
+            .content_type(ContentType::json())
+            .body(body)
+    }
+}
+
+impl ResponseError for UpdateError {
+    fn error_response(&self) -> HttpResponse<BoxBody> {
+        HttpResponse::build(self.status_code())
+            .insert_header(ContentType::plaintext())
+            .body(self.to_string())
+    }
+
+    fn status_code(&self) -> actix_web::http::StatusCode {
+        match self {
+            Self::IsFull => actix_web::http::StatusCode::INSUFFICIENT_STORAGE,
+            Self::IO(_) => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Mutex => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Validation(_) => actix_web::http::StatusCode::BAD_REQUEST,
+        }
+    }
+}
+
+impl From<DeltaError> for UpdateError {
+    fn from(value: DeltaError) -> Self {
+        match value {
+            DeltaError::IO(e) => Self::IO(e),
+            DeltaError::IsFull => Self::IsFull,
+            DeltaError::Mutex => Self::Mutex,
+            DeltaError::Validation(e) => Self::Validation(e),
+        }
+    }
+}
+
+async fn post_point(
+    request: Json<UpdateRequest>,
+    data: web::Data<ServerState>,
+) -> Result<UpdateResponse, UpdateError> {
+    if request
+        .indices
+        .iter()
+        .any(|t| *t as usize >= data.vocab_size)
+    {
+        return Err(UpdateError::Validation(
+            "The vector to insert contains terms outside of the vocabulary of the model"
+                .to_string(),
+        ));
+    }
+
+    let req = request.into_inner();
+    let ext_id = persist_delta_insert(
+        req.indices,
+        req.values,
+        &data.delta,
+        &data.log_dir,
+        (data.sketches.offsets.len() - 1) as u32,
+    )?;
+
+    Ok(UpdateResponse {
+        external_id: ext_id,
+    })
 }
 
 #[actix_web::main]
@@ -447,8 +576,10 @@ async fn main() -> Result<(), String> {
         ));
     }
 
-    let tombstones = Tombstones::with_capacity(index.graph.len() / 64);
+    let tombstones = Tombstones::with_capacity(index.graph.len() / 64 + MAX_DELTA);
     load_tombstones(&tombstones, &args.index_dir).map_err(|e| e.to_string())?;
+
+    let delta = load_delta(&args.index_dir, (index.graph.len() / 64) as u32)?;
 
     let state = web::Data::new(ServerState {
         mmap: Arc::new(mmap),
@@ -458,6 +589,7 @@ async fn main() -> Result<(), String> {
         scratch: Mutex::new(scratches),
         tombstones,
         log_dir: args.index_dir.clone(),
+        delta: RwLock::new(delta),
     });
 
     env_logger::init_from_env(
@@ -472,6 +604,7 @@ async fn main() -> Result<(), String> {
             .route("/info", web::get().to(get_info))
             .route("/search", web::post().to(post_search))
             .route("/points/{id}", web::delete().to(delete_point))
+            .route("/points", web::post().to(post_point))
     })
     .workers(args.num_workers)
     .bind((args.host.as_deref().unwrap_or("localhost"), args.port))

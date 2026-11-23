@@ -4,16 +4,18 @@ use std::{
     fs::{self, File},
     io::{BufReader, Read, Write},
     path::{Path, PathBuf},
+    sync::RwLock,
     time::Instant,
 };
 
 use clap::{Args, Parser, Subcommand};
 use grip_rs::{
     BuildParams, SearchParams, SparseVector, Visited, build_index,
+    delta::{MAX_DELTA, load_delta, persist_delta_insert},
     disk::decode_sparse_vectors_raw,
     read_index, read_sketches,
     robustprune::MAX_GRAPH_DEGREE,
-    save_index, save_vectors_and_sketches, search,
+    save_index, save_vectors_and_sketches, search_all,
     tombstone::{Tombstones, delete, load_tombstones},
 };
 use memmap2::Mmap;
@@ -40,6 +42,8 @@ enum Command {
     Search(SearchArgs),
     /// Mark documents of an index as deleted
     Delete(DeleteArgs),
+    /// Add new documents to an index, without rebuilding it
+    Update(UpdateArgs),
 }
 
 #[derive(Args)]
@@ -141,6 +145,22 @@ struct DeleteArgs {
     ids: Vec<u32>,
 }
 
+#[derive(Args)]
+struct UpdateArgs {
+    /// Directory that holds the index files written by `build`
+    #[arg(long)]
+    index_dir: PathBuf,
+    /// Path to the new documents (Seismic binary format)
+    #[arg(long)]
+    documents: PathBuf,
+    /// Vocabulary size of the index. Terms outside of it are rejected
+    #[arg(long)]
+    vocab_size: usize,
+    /// Add only the first N documents of the file
+    #[arg(long)]
+    n_documents: Option<usize>,
+}
+
 fn read_u32(reader: &mut impl Read) -> Result<u32, String> {
     let mut b = [0_u8; 4];
     reader
@@ -233,20 +253,22 @@ fn run_build(args: BuildArgs) -> Result<(), Box<dyn Error>> {
 fn run_search(args: SearchArgs) -> Result<(), Box<dyn Error>> {
     let index = read_index(args.index_dir.join(INDEX_FILE), args.vocab_size)?;
     let vectors_and_sketches = read_sketches(args.index_dir.join(SKETCHES_FILE))?;
+    let n_docs = index.graph.len() / MAX_GRAPH_DEGREE;
 
     let vectors_file = File::open(args.index_dir.join(VECTORS_FILE))?;
     // Safety: the vectors file must not change while it is mapped
     let mmap = unsafe { Mmap::map(&vectors_file)? };
 
-    let tombestones = Tombstones::with_capacity(index.graph.len() / MAX_GRAPH_DEGREE);
+    let tombestones = Tombstones::with_capacity(index.graph.len() / MAX_GRAPH_DEGREE + MAX_DELTA);
     load_tombstones(&tombestones, &args.index_dir)?;
+
+    let delta = load_delta(&args.index_dir, n_docs as u32)?;
 
     let queries = read_seismic_bin(&args.queries, args.n_queries)?;
     if queries.is_empty() {
         return Err("there are no queries to run".into());
     }
 
-    let n_docs = index.graph.len() / MAX_GRAPH_DEGREE;
     let mut visited = Visited {
         counter: 0,
         visited: vec![0; n_docs],
@@ -268,8 +290,9 @@ fn run_search(args: SearchArgs) -> Result<(), Box<dyn Error>> {
     let t = Instant::now();
     let mut dense = vec![0; args.vocab_size];
     let mut dense_rescoring = vec![0_f32; args.vocab_size];
+    let mut delta_acc = vec![0_f32; MAX_DELTA];
     for q in &queries {
-        results.push(search(
+        results.push(search_all(
             q,
             &vectors_and_sketches,
             &index,
@@ -279,6 +302,9 @@ fn run_search(args: SearchArgs) -> Result<(), Box<dyn Error>> {
             &mut dense_rescoring,
             &mmap,
             &tombestones,
+            n_docs as u32,
+            &delta,
+            &mut delta_acc,
         )?);
     }
     let elapsed = t.elapsed();
@@ -350,7 +376,12 @@ fn count_documents(index_dir: &Path) -> Result<usize, String> {
 }
 
 fn run_delete(args: DeleteArgs) -> Result<(), Box<dyn Error>> {
-    let n_docs = count_documents(&args.index_dir)?;
+    let n_main = count_documents(&args.index_dir)?;
+    // delta documents have the ids n_main, n_main + 1, ...
+    let n_delta = load_delta(&args.index_dir, u32::try_from(n_main)?)?
+        .docs
+        .len();
+    let n_docs = n_main + n_delta;
     // check every id first, so a bad id does not leave a half-applied deletion
     if let Some(id) = args.ids.iter().find(|&&id| id as usize >= n_docs) {
         return Err(
@@ -358,7 +389,7 @@ fn run_delete(args: DeleteArgs) -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let tombstones = Tombstones::with_capacity(n_docs);
+    let tombstones = Tombstones::with_capacity(n_main + MAX_DELTA);
     load_tombstones(&tombstones, &args.index_dir)?;
 
     let (mut deleted, mut already_deleted) = (0, 0);
@@ -379,10 +410,62 @@ fn run_delete(args: DeleteArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn run_update(args: UpdateArgs) -> Result<(), Box<dyn Error>> {
+    let n_docs = count_documents(&args.index_dir)?;
+    let base = u32::try_from(n_docs)?;
+    let new_docs = read_seismic_bin(&args.documents, args.n_documents)?;
+
+    // check everything first, so a bad document does not leave a half-applied update
+    if let Some(term) = new_docs
+        .iter()
+        .flat_map(|v| v.indices.iter())
+        .find(|&&t| t as usize >= args.vocab_size)
+    {
+        return Err(format!(
+            "term id {term} is out of range: the vocabulary size is {}",
+            args.vocab_size
+        )
+        .into());
+    }
+
+    let delta = RwLock::new(load_delta(&args.index_dir, base)?);
+    let existing = delta.lock().map_err(|e| e.to_string())?.docs.len();
+    if existing + new_docs.len() > MAX_DELTA {
+        return Err(format!(
+            "the delta holds {existing} documents and the limit is {MAX_DELTA}: cannot add {} more",
+            new_docs.len()
+        )
+        .into());
+    }
+
+    let t = Instant::now();
+    let mut ids: Vec<u32> = Vec::with_capacity(new_docs.len());
+    for v in new_docs {
+        ids.push(persist_delta_insert(
+            v.indices,
+            v.values,
+            &delta,
+            &args.index_dir,
+            base,
+        )?);
+    }
+    match (ids.first(), ids.last()) {
+        (Some(first), Some(last)) => eprintln!(
+            "added {} documents with ids {first}..={last} in {:.1?}",
+            ids.len(),
+            t.elapsed()
+        ),
+        _ => eprintln!("there are no documents to add"),
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     match Cli::parse().command {
         Command::Build(args) => run_build(args),
         Command::Search(args) => run_search(args),
         Command::Delete(args) => run_delete(args),
+        Command::Update(args) => run_update(args),
     }
 }
