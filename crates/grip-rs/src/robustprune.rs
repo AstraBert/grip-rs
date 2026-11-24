@@ -31,6 +31,16 @@ impl AsF32 for half::bf16 {
     }
 }
 
+impl AsF32 for u32 {
+    fn as_f32(&self) -> f32 {
+        *self as f32
+    }
+
+    fn safe_compare(&self, other: &Self) -> Ordering {
+        self.cmp(other)
+    }
+}
+
 pub fn robust_prune<T: AsF32 + Clone>(
     candidates: Vec<(u32, T)>,
     alpha: f32,

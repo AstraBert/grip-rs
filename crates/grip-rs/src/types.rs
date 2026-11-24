@@ -87,6 +87,13 @@ impl SparseVector {
         Ok(SparseVector { indices, values })
     }
 
+    pub fn from_id_value_pairs_unchecked(v: &Vec<(u32, f32)>) -> Self {
+        Self {
+            indices: v.iter().map(|v| v.0).collect(),
+            values: v.iter().map(|v| v.1).collect(),
+        }
+    }
+
     pub fn is_optimal(&self) -> bool {
         self.indices.len() == self.values.len()
             && !self.values.iter().any(|v| *v == 0_f32 || v.is_nan())
@@ -219,6 +226,17 @@ impl SparseVector {
 
         QuantizedSparseVector::new(indices, values)
     }
+
+    pub fn quantize_unchecked(&self, scale: f32) -> QuantizedSparseVector {
+        let indices = self.indices.clone();
+        let mut values: Vec<u8> = vec![];
+        for v in self.values.iter() {
+            let q = (*v / scale).round().min(255_f32);
+            values.push(q as u8);
+        }
+
+        QuantizedSparseVector::new_unchecked(indices, values)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,6 +246,10 @@ pub struct QuantizedSparseVector {
 }
 
 impl QuantizedSparseVector {
+    pub fn new_unchecked(indices: Vec<u32>, values: Vec<u8>) -> Self {
+        Self { indices, values }
+    }
+
     pub fn new(indices: Vec<u32>, values: Vec<u8>) -> Result<Self, String> {
         if indices.len() != values.len() {
             return Err(format!(
@@ -277,6 +299,13 @@ impl QuantizedSparseVector {
     pub fn truncate(&mut self, dim: usize) {
         self.indices.truncate(dim);
         self.values.truncate(dim);
+    }
+
+    pub fn from_slices_unchecked(i: &[u32], v: &[u8]) -> Self {
+        Self {
+            indices: i.to_vec(),
+            values: v.to_vec(),
+        }
     }
 }
 
