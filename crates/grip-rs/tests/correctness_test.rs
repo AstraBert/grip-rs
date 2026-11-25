@@ -9,7 +9,7 @@ use std::{
 use grip_rs::{
     BuildParams, IndexOutput, SearchParams, SparseVector, VectorsAndSketches, Visited, build_index,
     compact::compact,
-    delta::{DELTA_LOG_FILE, Delta, MAX_DELTA, load_delta, persist_delta_insert},
+    delta::{DELTA_LOG_FILE, Delta, MAX_DELTA, delta_insert, load_delta, persist_delta_insert},
     disk::decode_sparse_vectors_raw,
     healer::heal,
     read_index, read_sketches,
@@ -554,13 +554,16 @@ fn test_delta_survives_restart() {
 
     let reloaded = load_delta(env.dir.path(), env.n_main()).expect("Should load the delta");
     assert_eq!(reloaded.docs.len(), env.extra.len());
-    let expected_ids: Vec<u32> = (0..env.extra.len() as u32)
-        .map(|i| env.n_main() + i)
-        .collect();
-    assert_eq!(reloaded.ext_ids, expected_ids);
 
     let after = env.search_all(&tombstones, &reloaded);
     assert_eq!(before, after);
+
+    // the external ids continue where they stopped
+    let reloaded = RwLock::new(reloaded);
+    let (indices, values) = some_vector(1);
+    let id =
+        persist_delta_insert(indices, values, &reloaded, env.dir.path(), env.n_main()).unwrap();
+    assert_eq!(id, env.n_main() + env.extra.len() as u32);
 }
 
 fn some_vector(seed: u32) -> (Vec<u32>, Vec<f32>) {
@@ -598,7 +601,6 @@ fn test_delta_torn_log() {
     );
     let again = load_delta(dir.path(), base).unwrap();
     assert_eq!(again.docs.len(), 4);
-    assert_eq!(again.ext_ids, vec![100, 101, 102, 103]);
 }
 
 /// A log that does not match the index it is loaded for is rejected.
@@ -702,7 +704,12 @@ fn search_index(
         .collect()
 }
 
-fn mean_recall(queries: &[SparseVector], results: &[Vec<(u32, f32)>], oracle: &Oracle, k: usize) -> f32 {
+fn mean_recall(
+    queries: &[SparseVector],
+    results: &[Vec<(u32, f32)>],
+    oracle: &Oracle,
+    k: usize,
+) -> f32 {
     let (mut total, mut counted) = (0_f32, 0_usize);
     for (q, res) in queries.iter().zip(results) {
         let exact = oracle.search(q, k);
@@ -752,7 +759,10 @@ fn test_heal_removes_every_deleted_edge() {
                 .iter()
                 .any(|x| *x != u32::MAX && tombstones.is_deleted(*x));
             if !had_deleted {
-                assert_eq!(old, new, "row {p} had no deleted neighbor, so it must not change");
+                assert_eq!(
+                    old, new,
+                    "row {p} had no deleted neighbor, so it must not change"
+                );
                 continue;
             }
             healed_rows += 1;
@@ -760,7 +770,10 @@ fn test_heal_removes_every_deleted_edge() {
             let live: Vec<u32> = new.iter().copied().filter(|x| *x != u32::MAX).collect();
             for x in &live {
                 assert!((*x as usize) < n, "row {p} has the id {x}, out of range");
-                assert!(!tombstones.is_deleted(*x), "row {p} still points at the deleted node {x}");
+                assert!(
+                    !tombstones.is_deleted(*x),
+                    "row {p} still points at the deleted node {x}"
+                );
                 assert_ne!(*x as usize, p, "row {p} points at itself");
             }
             assert_eq!(
@@ -773,7 +786,10 @@ fn test_heal_removes_every_deleted_edge() {
                 "row {p}: the padding is not at the end"
             );
         }
-        assert!(healed_rows > 0, "no row had a deleted neighbor, the test checks nothing");
+        assert!(
+            healed_rows > 0,
+            "no row had a deleted neighbor, the test checks nothing"
+        );
     }
 }
 
@@ -808,7 +824,11 @@ fn test_heal_keeps_recall() {
 
         let before = mean_recall(&env.queries, &with_tombstones, &oracle, k);
         let after = mean_recall(&env.queries, &with_healed, &oracle, k);
-        assert!(after > 0.5, "{}% deleted: recall after healing is {after}", 100 / stride);
+        assert!(
+            after > 0.5,
+            "{}% deleted: recall after healing is {after}",
+            100 / stride
+        );
         assert!(
             after >= before - 0.02,
             "{}% deleted: healing lowered the recall from {before} to {after}",
@@ -822,8 +842,10 @@ fn test_heal_keeps_recall() {
 struct Compacted {
     _dir: TempDir,
     n_live: usize,
-    /// new position -> old id
+    /// new position -> external id
     ids: Vec<u32>,
+    /// the external id of the first document of the next delta
+    ext_base: u32,
     index: IndexOutput,
     sketches: VectorsAndSketches,
     mmap: Mmap,
@@ -836,19 +858,44 @@ fn run_compact(
     tombstones: &Tombstones,
     graph: Vec<u32>,
 ) -> Compacted {
+    compact_any(
+        &env.index,
+        &env.sketches,
+        &env.mmap,
+        &(0..N_MAIN as u32).collect::<Vec<u32>>(),
+        N_MAIN as u32,
+        delta,
+        tombstones,
+        &graph,
+    )
+}
+
+/// Compacts any index: `ids` and `ext_base` are the ones of that index
+/// (the identity for a fresh build, the content of `ids.bin` after a compaction).
+fn compact_any(
+    index_output: &IndexOutput,
+    sketches_in: &VectorsAndSketches,
+    mmap_in: &Mmap,
+    ids_in: &[u32],
+    ext_base_in: u32,
+    delta: &Delta,
+    tombstones: &Tombstones,
+    graph: &[u32],
+) -> Compacted {
     let dir = tempfile::tempdir_in(".").expect("Should be able to create temporary directory");
     let build = BuildParams::from_defaults(VOCAB_SIZE);
     let search = SearchParams::default();
-    let source = IndexOutput::new(graph, env.index.seeds.clone(), env.index.term_max.clone());
 
-    let n_live = compact(
+    let (n_live, returned_ext_base) = compact(
         dir.path(),
         tombstones,
         delta,
-        env.main.len(),
-        &env.mmap,
-        &env.sketches,
-        &source,
+        ext_base_in,
+        ids_in,
+        mmap_in,
+        sketches_in,
+        index_output,
+        graph,
         VOCAB_SIZE,
         build.sketch_size,
         build.entrypoint_seeds,
@@ -864,8 +911,11 @@ fn run_compact(
     let vectors_file = File::open(dir.path().join("vectors.bin")).expect("Should open vectors");
     // Safety: the vectors file must not change while it is mapped
     let mmap = unsafe { Mmap::map(&vectors_file).expect("Should mmap") };
-    let ids: Vec<u32> = fs::read(dir.path().join("ids.bin"))
-        .expect("Should read ids.bin")
+    // ids.bin = [ext_base | external id of every position]
+    let ids_bytes = fs::read(dir.path().join("ids.bin")).expect("Should read ids.bin");
+    let ext_base = u32::from_le_bytes(ids_bytes[0..4].try_into().unwrap());
+    assert_eq!(ext_base, returned_ext_base);
+    let ids: Vec<u32> = ids_bytes[4..]
         .chunks_exact(4)
         .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
         .collect();
@@ -874,6 +924,7 @@ fn run_compact(
         _dir: dir,
         n_live,
         ids,
+        ext_base,
         index,
         sketches,
         mmap,
@@ -935,6 +986,8 @@ fn test_compact_merges_delta_and_drops_deleted() {
             .collect();
         assert_eq!(c.n_live, total - deleted.len(), "{label}");
         assert_eq!(c.ids, expected_ids, "{label}: ids.bin");
+        // deleted delta documents count too: their ids are never used again
+        assert_eq!(c.ext_base, total as u32, "{label}: ext_base");
         assert_eq!(c.sketches.offsets.len(), c.n_live + 1, "{label}: sketches");
 
         // vectors and sketches follow the renumbering
@@ -944,9 +997,15 @@ fn test_compact_merges_delta_and_drops_deleted() {
             let doc = &all_docs[*old as usize];
             let got_indices: Vec<u32> = raw[new].iter().map(|x| x.0).collect();
             let got_values: Vec<f32> = raw[new].iter().map(|x| x.1).collect();
-            assert_eq!(got_indices, doc.indices, "{label}: vector {old} (now {new})");
+            assert_eq!(
+                got_indices, doc.indices,
+                "{label}: vector {old} (now {new})"
+            );
             assert_eq!(got_values, doc.values, "{label}: vector {old} (now {new})");
-            assert!(c.sketches.get(new).is_some(), "{label}: no sketch for {new}");
+            assert!(
+                c.sketches.get(new).is_some(),
+                "{label}: no sketch for {new}"
+            );
             if (*old as usize) < N_MAIN {
                 assert_eq!(
                     c.sketches.get(new),
@@ -1000,16 +1059,29 @@ fn test_compact_merges_delta_and_drops_deleted() {
 
         // search, with ids translated back to the old ones
         let none = Tombstones::with_capacity(0);
-        let results: Vec<Vec<(u32, f32)>> =
-            search_index(&env.queries, &c.sketches, &c.index, &c.mmap, c.n_live, &none)
-                .into_iter()
-                .map(|res| res.into_iter().map(|(id, s)| (c.ids[id as usize], s)).collect())
-                .collect();
+        let results: Vec<Vec<(u32, f32)>> = search_index(
+            &env.queries,
+            &c.sketches,
+            &c.index,
+            &c.mmap,
+            c.n_live,
+            &none,
+        )
+        .into_iter()
+        .map(|res| {
+            res.into_iter()
+                .map(|(id, s)| (c.ids[id as usize], s))
+                .collect()
+        })
+        .collect();
 
         for (q, res) in env.queries.iter().zip(&results) {
             let all: HashMap<u32, f32> = oracle.search(q, usize::MAX).into_iter().collect();
             for (id, score) in res {
-                assert!(!tombstones.is_deleted(*id), "{label}: deleted document {id} returned");
+                assert!(
+                    !tombstones.is_deleted(*id),
+                    "{label}: deleted document {id} returned"
+                );
                 if let Some(expected) = all.get(id) {
                     assert!(
                         (score - expected).abs() <= 1e-3 * expected.abs().max(1.0),
@@ -1025,7 +1097,10 @@ fn test_compact_merges_delta_and_drops_deleted() {
             after >= before - 0.03,
             "{label}: compaction lowered the recall from {before} to {after}"
         );
-        println!("{label}: recall {before:.4} -> {after:.4}, {} documents", c.n_live);
+        println!(
+            "{label}: recall {before:.4} -> {after:.4}, {} documents",
+            c.n_live
+        );
     }
 }
 
@@ -1039,10 +1114,251 @@ fn test_compact_without_changes_is_identity() {
 
     assert_eq!(c.n_live, N_MAIN);
     assert_eq!(c.ids, (0..N_MAIN as u32).collect::<Vec<u32>>());
+    assert_eq!(c.ext_base, N_MAIN as u32);
     assert_eq!(c.index.graph, env.index.graph);
     assert_eq!(c.sketches.offsets, env.sketches.offsets);
     assert_eq!(c.sketches.indices, env.sketches.indices);
     assert_eq!(c.sketches.values, env.sketches.values);
     assert_eq!(c.sketches.scale, env.sketches.scale);
     assert_eq!(&c.mmap[..], &env.mmap[..]);
+}
+
+/// The structure of a compacted graph: the padding is at the end of every row, every id
+/// is in range, and no row points at itself or twice at the same node.
+fn check_graph_structure(graph: &[u32], n_live: usize, label: &str) {
+    let degree = MAX_GRAPH_DEGREE;
+    assert_eq!(graph.len(), n_live * degree, "{label}");
+    for p in 0..n_live {
+        let row = &graph[p * degree..(p + 1) * degree];
+        let live: Vec<u32> = row.iter().copied().filter(|x| *x != u32::MAX).collect();
+        assert!(
+            row[..live.len()].iter().all(|x| *x != u32::MAX),
+            "{label}: row {p}: the padding is not at the end"
+        );
+        for x in &live {
+            assert!((*x as usize) < n_live, "{label}: row {p} has the id {x}");
+            assert_ne!(*x as usize, p, "{label}: row {p} points at itself");
+        }
+        assert_eq!(
+            live.iter().collect::<HashSet<_>>().len(),
+            live.len(),
+            "{label}: row {p} has a duplicate"
+        );
+    }
+}
+
+/// Every main document is deleted: only the delta documents are left.
+/// - the ids are the external ids of the delta documents, and `ext_base` moves past them
+/// - the vectors are the delta documents
+/// - the graph is valid, and the search still finds the documents
+#[test]
+fn test_compact_when_every_main_document_is_deleted() {
+    let env = insert_env();
+    let total = N_MAIN + env.extra.len();
+    let k = SearchParams::default().top_k;
+
+    let mut delta = Delta::default();
+    for v in &env.extra {
+        delta_insert(&mut delta, v.clone());
+    }
+    let tombstones = Tombstones::with_capacity(total);
+    for id in 0..N_MAIN as u32 {
+        assert!(tombstones.delete(id));
+    }
+
+    let c = compact_any(
+        &env.index,
+        &env.sketches,
+        &env.mmap,
+        &(0..N_MAIN as u32).collect::<Vec<u32>>(),
+        N_MAIN as u32,
+        &delta,
+        &tombstones,
+        &env.index.graph,
+    );
+
+    let n_delta = delta.docs.len();
+    assert_eq!(c.n_live, n_delta);
+    assert_eq!(c.ids, (N_MAIN as u32..total as u32).collect::<Vec<u32>>());
+    assert_eq!(c.ext_base, total as u32);
+    assert_eq!(c.sketches.offsets.len(), n_delta + 1);
+
+    let raw = decode_sparse_vectors_raw(&c.mmap, None).expect("Should decode");
+    assert_eq!(raw.len(), n_delta);
+    for (new, doc) in delta.docs.iter().enumerate() {
+        let got_indices: Vec<u32> = raw[new].iter().map(|x| x.0).collect();
+        let got_values: Vec<f32> = raw[new].iter().map(|x| x.1).collect();
+        assert_eq!(got_indices, doc.indices, "vector {new}");
+        assert_eq!(got_values, doc.values, "vector {new}");
+        assert!(c.sketches.get(new).is_some(), "no sketch for {new}");
+    }
+
+    check_graph_structure(&c.index.graph, n_delta, "only delta");
+    let with_edges = (0..n_delta)
+        .filter(|p| c.index.graph[p * MAX_GRAPH_DEGREE] != u32::MAX)
+        .count();
+    println!("only delta: {with_edges} of {n_delta} documents have a neighbor");
+
+    // search: the oracle holds the delta documents, with the new ids
+    let oracle = Oracle::new(delta.docs.clone(), VOCAB_SIZE);
+    let none = Tombstones::with_capacity(0);
+    let results = search_index(&env.queries, &c.sketches, &c.index, &c.mmap, n_delta, &none);
+    let recall = mean_recall(&env.queries, &results, &oracle, k);
+    println!("only delta: recall {recall:.4}");
+    assert!(recall > 0.5, "recall is {recall}");
+}
+
+/// Compacting twice: the second compaction starts from an index whose `ids` are not the
+/// identity and whose `ext_base` is past the first delta.
+/// - `ids.bin` keeps the external ids of the survivors of both rounds
+/// - the new delta documents get `ext_base`, `ext_base + 1`, ... and the new `ext_base`
+///   counts them (deleted ones too)
+/// - vectors, graph and search are right
+#[test]
+fn test_compact_twice() {
+    let env = insert_env();
+    let total = N_MAIN + env.extra.len();
+    let k = SearchParams::default().top_k;
+
+    // round 1: some documents are deleted, the delta is merged
+    let mut delta1 = Delta::default();
+    for v in &env.extra {
+        delta_insert(&mut delta1, v.clone());
+    }
+    let all_docs: Vec<SparseVector> = env
+        .main
+        .iter()
+        .cloned()
+        .chain(delta1.docs.iter().cloned())
+        .collect();
+    let (tombstones1, deleted1) = tombstones_for(total, 5, 2);
+    let c1 = compact_any(
+        &env.index,
+        &env.sketches,
+        &env.mmap,
+        &(0..N_MAIN as u32).collect::<Vec<u32>>(),
+        N_MAIN as u32,
+        &delta1,
+        &tombstones1,
+        &heal_graph(&env, &tombstones1),
+    );
+    assert_eq!(c1.ext_base, total as u32);
+    let n1 = c1.n_live;
+
+    // round 2: new documents, and deletions over the internal ids of round 1
+    let mut delta2 = Delta::default();
+    for q in env.queries.iter().take(100) {
+        delta_insert(&mut delta2, q.clone());
+    }
+    let n_delta2 = delta2.docs.len();
+    let (tombstones2, deleted2) = tombstones_for(n1 + n_delta2, 3, 1);
+    let healed2 = heal(
+        &c1.index.graph,
+        &tombstones2,
+        HEAL_ALPHA,
+        HEAL_MAX_DFS,
+        HEAL_MAX_BORDER,
+        VOCAB_SIZE,
+        &c1.mmap,
+    )
+    .expect("Should heal");
+    let c2 = compact_any(
+        &c1.index,
+        &c1.sketches,
+        &c1.mmap,
+        &c1.ids,
+        c1.ext_base,
+        &delta2,
+        &tombstones2,
+        &healed2,
+    );
+
+    // the external id of every internal id of round 1, then of the new delta
+    let ext_of: Vec<u32> = c1
+        .ids
+        .iter()
+        .copied()
+        .chain((0..n_delta2 as u32).map(|j| c1.ext_base + j))
+        .collect();
+    let expected_ids: Vec<u32> = (0..n1 + n_delta2)
+        .filter(|i| !tombstones2.is_deleted(*i as u32))
+        .map(|i| ext_of[i])
+        .collect();
+    assert_eq!(c2.n_live, n1 + n_delta2 - deleted2.len());
+    assert_eq!(c2.ids, expected_ids, "ids.bin");
+    assert_eq!(c2.ext_base, c1.ext_base + n_delta2 as u32, "ext_base");
+    assert!(c2.ids.windows(2).all(|w| w[0] < w[1]), "ids are not sorted");
+    assert_eq!(c2.sketches.offsets.len(), c2.n_live + 1);
+
+    // what every external id holds
+    let doc_of = |ext: u32| -> &SparseVector {
+        if (ext as usize) < total {
+            &all_docs[ext as usize]
+        } else {
+            &delta2.docs[(ext - c1.ext_base) as usize]
+        }
+    };
+    let raw = decode_sparse_vectors_raw(&c2.mmap, None).expect("Should decode");
+    assert_eq!(raw.len(), c2.n_live);
+    for (new, ext) in c2.ids.iter().enumerate() {
+        let doc = doc_of(*ext);
+        let got_indices: Vec<u32> = raw[new].iter().map(|x| x.0).collect();
+        let got_values: Vec<f32> = raw[new].iter().map(|x| x.1).collect();
+        assert_eq!(got_indices, doc.indices, "vector {ext} (now {new})");
+        assert_eq!(got_values, doc.values, "vector {ext} (now {new})");
+    }
+
+    check_graph_structure(&c2.index.graph, c2.n_live, "second compaction");
+
+    // search, with ids translated to external ones. The oracle is indexed by external id.
+    let mut oracle = Oracle::new(
+        all_docs
+            .iter()
+            .cloned()
+            .chain(delta2.docs.iter().cloned())
+            .collect(),
+        VOCAB_SIZE,
+    );
+    let deleted_ext: HashSet<u32> = deleted1
+        .iter()
+        .copied()
+        .chain(deleted2.iter().map(|i| ext_of[*i as usize]))
+        .collect();
+    for ext in &deleted_ext {
+        oracle.delete(*ext);
+    }
+    let none = Tombstones::with_capacity(0);
+    let results: Vec<Vec<(u32, f32)>> = search_index(
+        &env.queries,
+        &c2.sketches,
+        &c2.index,
+        &c2.mmap,
+        c2.n_live,
+        &none,
+    )
+    .into_iter()
+    .map(|res| {
+        res.into_iter()
+            .map(|(id, s)| (c2.ids[id as usize], s))
+            .collect()
+    })
+    .collect();
+    for (q, res) in env.queries.iter().zip(&results) {
+        let all: HashMap<u32, f32> = oracle.search(q, usize::MAX).into_iter().collect();
+        for (id, score) in res {
+            assert!(!deleted_ext.contains(id), "deleted document {id} returned");
+            if let Some(expected) = all.get(id) {
+                assert!(
+                    (score - expected).abs() <= 1e-3 * expected.abs().max(1.0),
+                    "document {id}: got a score of {score}, expected {expected}"
+                );
+            }
+        }
+    }
+    let recall = mean_recall(&env.queries, &results, &oracle, k);
+    println!(
+        "second compaction: recall {recall:.4}, {} documents",
+        c2.n_live
+    );
+    assert!(recall > 0.5, "recall is {recall}");
 }

@@ -14,6 +14,15 @@ pub struct Tombstones {
 }
 
 impl Tombstones {
+    pub fn make_copy(&self) -> Self {
+        Self {
+            words: (0..self.words.len())
+                .map(|i| AtomicU64::new(self.words[i].load(Ordering::Relaxed)))
+                .collect(),
+            count: AtomicUsize::new(self.count.load(Ordering::Relaxed)),
+        }
+    }
+
     pub fn with_capacity(n: usize) -> Self {
         let n_words = n.div_ceil(64);
         Self {

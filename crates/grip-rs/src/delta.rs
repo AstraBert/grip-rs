@@ -34,10 +34,9 @@ impl Display for DeltaError {
 
 impl Error for DeltaError {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Delta {
     pub docs: Vec<SparseVector>,
-    pub ext_ids: Vec<u32>,
     pub postings: HashMap<u32, Vec<(u32, f32)>>,
 }
 
@@ -45,13 +44,12 @@ impl Default for Delta {
     fn default() -> Self {
         Self {
             docs: Vec::with_capacity(MAX_DELTA),
-            ext_ids: Vec::with_capacity(MAX_DELTA),
             postings: HashMap::new(),
         }
     }
 }
 
-pub fn delta_insert(delta: &mut Delta, vector: SparseVector, ext_id: u32) {
+pub fn delta_insert(delta: &mut Delta, vector: SparseVector) {
     let local_base = delta.docs.len();
     for (t, w) in vector.indices.iter().zip(vector.values.iter()) {
         delta
@@ -69,7 +67,6 @@ pub fn delta_insert(delta: &mut Delta, vector: SparseVector, ext_id: u32) {
             )]);
     }
     delta.docs.push(vector);
-    delta.ext_ids.push(ext_id);
 }
 
 pub fn delta_search(
@@ -77,7 +74,7 @@ pub fn delta_search(
     query: &SparseVector,
     k: usize,
     tombstones: &Tombstones,
-    base: u32,
+    internal_base: u32,
     acc: &mut Vec<f32>,
 ) -> Vec<(u32, f32)> {
     let mut touched: Vec<u32> = vec![];
@@ -91,12 +88,12 @@ pub fn delta_search(
             }
         }
     }
-    touched.retain(|v| !tombstones.is_deleted(*v + base));
+    touched.retain(|v| !tombstones.is_deleted(*v + internal_base));
     touched.sort_by(|a, b| acc[*b as usize].total_cmp(&acc[*a as usize]));
     let results = touched
         .iter()
         .take(k)
-        .map(|v| (*v + base, acc[*v as usize]))
+        .map(|v| (*v + internal_base, acc[*v as usize]))
         .collect::<Vec<(u32, f32)>>();
     for t in &touched {
         acc[*t as usize] = 0.0;
@@ -109,7 +106,7 @@ pub fn persist_delta_insert(
     values: Vec<f32>,
     delta: &RwLock<Delta>,
     log_dir: &Path,
-    base: u32,
+    ext_base: u32,
 ) -> Result<u32, DeltaError> {
     let validated = SparseVector::new(indices, values).map_err(|e| DeltaError::Validation(e))?;
     let mut delta_m = delta.write().map_err(|_| DeltaError::Mutex)?;
@@ -117,7 +114,7 @@ pub fn persist_delta_insert(
         drop(delta_m);
         return Err(DeltaError::IsFull);
     }
-    let ext_id = base + delta_m.docs.len() as u32;
+    let ext_id = ext_base + delta_m.docs.len() as u32;
     let mut content: Vec<u8> = Vec::with_capacity(validated.indices.len() * 8 + 8);
     content.extend_from_slice(
         &u32::try_from(validated.indices.len())
@@ -140,7 +137,7 @@ pub fn persist_delta_insert(
         .map_err(|e| DeltaError::IO(format!("Error while writing to file: {e}")))?;
     op.flush()
         .map_err(|e| DeltaError::IO(format!("Error while flushing: {e}")))?;
-    delta_insert(&mut delta_m, validated, ext_id);
+    delta_insert(&mut delta_m, validated);
     drop(delta_m);
     Ok(ext_id)
 }
@@ -179,7 +176,7 @@ fn read_record(buf: &[u8], pos: usize) -> Option<(SparseVector, u32, usize)> {
     Some((SparseVector { indices, values }, ext_id, end))
 }
 
-pub fn load_delta(log_dir: &Path, base: u32) -> Result<Delta, String> {
+pub fn load_delta(log_dir: &Path, ext_base: u32) -> Result<Delta, String> {
     let content = match fs::read(log_dir.join(DELTA_LOG_FILE)) {
         Ok(c) => c,
         Err(e) => match e.kind() {
@@ -189,15 +186,13 @@ pub fn load_delta(log_dir: &Path, base: u32) -> Result<Delta, String> {
     };
     let mut pos = 0;
     let mut docs: Vec<SparseVector> = vec![];
-    let mut ext_ids: Vec<u32> = vec![];
     loop {
         let opt = read_record(&content, pos);
         if let Some((v, i, new_pos)) = opt {
-            if i != docs.len() as u32 + base {
+            if i != ext_base + docs.len() as u32 {
                 return Err(format!(
-                    "Expecting external ID to be {}, found {}",
-                    docs.len() as u32 + base,
-                    i
+                    "Unexpected external ID: got {i}, expected {}",
+                    ext_base + docs.len() as u32
                 ));
             }
             if docs.len() == MAX_DELTA {
@@ -205,7 +200,6 @@ pub fn load_delta(log_dir: &Path, base: u32) -> Result<Delta, String> {
             }
             pos = new_pos;
             docs.push(v);
-            ext_ids.push(i);
         } else {
             if pos < content.len() {
                 let fl = fs::OpenOptions::new()
@@ -230,11 +224,7 @@ pub fn load_delta(log_dir: &Path, base: u32) -> Result<Delta, String> {
                     .map(|(i, _)| i as u32)
                     .collect::<Vec<u32>>(),
             );
-            return Ok(Delta {
-                docs,
-                ext_ids,
-                postings,
-            });
+            return Ok(Delta { docs, postings });
         }
     }
 }

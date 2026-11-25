@@ -1,4 +1,9 @@
-use std::{fs, io, io::Write, path::Path, sync::Mutex};
+use std::{
+    fs,
+    io::{self, Write},
+    path::Path,
+    sync::Mutex,
+};
 
 use crate::{
     disk::{decode_sparse_sketches, write_vectors},
@@ -13,6 +18,7 @@ use crate::{
 use half::bf16;
 use rayon::prelude::*;
 
+mod cleanup;
 pub mod compact;
 pub mod delta;
 pub mod disk;
@@ -27,6 +33,7 @@ mod timing;
 pub mod tombstone;
 mod types;
 
+pub use cleanup::*;
 pub use search::*;
 pub use types::*;
 
