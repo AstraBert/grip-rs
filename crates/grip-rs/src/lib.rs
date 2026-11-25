@@ -1,4 +1,9 @@
-use std::{fs, io, io::Write, path::Path, sync::Mutex};
+use std::{
+    fs,
+    io::{self, Write},
+    path::Path,
+    sync::Mutex,
+};
 
 use crate::{
     disk::{decode_sparse_sketches, write_vectors},
@@ -8,20 +13,27 @@ use crate::{
     robustprune::{MAX_GRAPH_DEGREE, robust_prune},
     seeding::{SeedVecs, build_seed_list, encode_seed_vecs, read_seed_vec_from_bytes},
     timing::{CpuClock, Phases},
+    tombstone::Tombstones,
 };
 use half::bf16;
 use rayon::prelude::*;
 
+mod cleanup;
+pub mod compact;
+pub mod delta;
 pub mod disk;
 pub mod hashprune;
+pub mod healer;
 pub mod leaf;
 pub mod partition;
 pub mod robustprune;
 mod search;
 pub mod seeding;
 mod timing;
+pub mod tombstone;
 mod types;
 
+pub use cleanup::*;
 pub use search::*;
 pub use types::*;
 
@@ -138,6 +150,7 @@ fn refine(
                     graph,
                     params.refinement_ef.unwrap(),
                     params.refinement_patience.unwrap(),
+                    &Tombstones::with_capacity(0),
                 )?;
 
                 let mut pool = found.iter().map(|v| v.1).collect::<Vec<u32>>();

@@ -9,11 +9,12 @@ use std::{
 
 use clap::{Args, Parser, Subcommand};
 use grip_rs::{
-    BuildParams, SearchParams, SparseVector, Visited, build_index, disk::decode_sparse_vectors_raw,
-    read_index, read_sketches, robustprune::MAX_GRAPH_DEGREE, save_index,
-    save_vectors_and_sketches, search,
+    BuildParams, MutableIndex, SearchParams, SparseVector, Visited, build_index,
+    delta::{MAX_DELTA, persist_delta_insert},
+    disk::decode_sparse_vectors_raw,
+    save_index, save_vectors_and_sketches, search_all,
+    tombstone::delete,
 };
-use memmap2::Mmap;
 
 const INDEX_FILE: &str = "index.bin";
 const VECTORS_FILE: &str = "vectors.bin";
@@ -35,6 +36,10 @@ enum Command {
     Build(BuildArgs),
     /// Search an index with a set of queries
     Search(SearchArgs),
+    /// Mark documents of an index as deleted
+    Delete(DeleteArgs),
+    /// Add new documents to an index, without rebuilding it
+    Update(UpdateArgs),
 }
 
 #[derive(Args)]
@@ -42,7 +47,7 @@ struct BuildArgs {
     /// Path to the documents file (Seismic binary format)
     #[arg(long)]
     documents: PathBuf,
-    /// Directory where the index files are written
+    /// Base directory of the index. The files are written to its `v0` folder
     #[arg(long)]
     output_dir: PathBuf,
     /// Index only the first N documents of the file
@@ -91,7 +96,7 @@ struct BuildArgs {
 
 #[derive(Args)]
 struct SearchArgs {
-    /// Directory that holds the index files written by `build`
+    /// Base directory of the index (the one given to `build`)
     #[arg(long)]
     index_dir: PathBuf,
     /// Path to the queries file (Seismic binary format)
@@ -124,6 +129,35 @@ struct SearchArgs {
     /// For rescoring against full-precision vectors, consider top_k x rescore_factor candidates.
     #[arg(long, default_value_t = 5)]
     rescore_factor: usize,
+}
+
+#[derive(Args)]
+struct DeleteArgs {
+    /// Base directory of the index (the one given to `build`)
+    #[arg(long)]
+    index_dir: PathBuf,
+    /// Ids of the documents to delete, separated by commas
+    #[arg(long, required = true, value_delimiter = ',')]
+    ids: Vec<u32>,
+    /// Vocabulary size of the index
+    #[arg(long)]
+    vocab_size: usize,
+}
+
+#[derive(Args)]
+struct UpdateArgs {
+    /// Base directory of the index (the one given to `build`)
+    #[arg(long)]
+    index_dir: PathBuf,
+    /// Path to the new documents (Seismic binary format)
+    #[arg(long)]
+    documents: PathBuf,
+    /// Vocabulary size of the index. Terms outside of it are rejected
+    #[arg(long)]
+    vocab_size: usize,
+    /// Add only the first N documents of the file
+    #[arg(long)]
+    n_documents: Option<usize>,
 }
 
 fn read_u32(reader: &mut impl Read) -> Result<u32, String> {
@@ -195,20 +229,21 @@ fn run_build(args: BuildArgs) -> Result<(), Box<dyn Error>> {
         args.refinement_patience,
     )?;
 
-    fs::create_dir_all(&args.output_dir)?;
+    let version_dir = args.output_dir.join("v0");
+    fs::create_dir_all(&version_dir)?;
 
     let t = Instant::now();
     let (graph, seeds, term_max, sketches, scale) = build_index(&vectors, params)?;
     eprintln!("built the index in {:.1?}", t.elapsed());
 
     let t = Instant::now();
-    save_index(graph, seeds, term_max, args.output_dir.join(INDEX_FILE))?;
+    save_index(graph, seeds, term_max, version_dir.join(INDEX_FILE))?;
     save_vectors_and_sketches(
         vectors,
         sketches,
         scale,
-        args.output_dir.join(VECTORS_FILE),
-        args.output_dir.join(SKETCHES_FILE),
+        version_dir.join(VECTORS_FILE),
+        version_dir.join(SKETCHES_FILE),
     )?;
     eprintln!("saved the files in {:.1?}", t.elapsed());
 
@@ -216,19 +251,16 @@ fn run_build(args: BuildArgs) -> Result<(), Box<dyn Error>> {
 }
 
 fn run_search(args: SearchArgs) -> Result<(), Box<dyn Error>> {
-    let index = read_index(args.index_dir.join(INDEX_FILE), args.vocab_size)?;
-    let vectors_and_sketches = read_sketches(args.index_dir.join(SKETCHES_FILE))?;
-
-    let vectors_file = File::open(args.index_dir.join(VECTORS_FILE))?;
-    // Safety: the vectors file must not change while it is mapped
-    let mmap = unsafe { Mmap::map(&vectors_file)? };
+    let mi = MutableIndex::from_env(&args.index_dir, args.vocab_size, false)?;
+    // search results are internal ids: only the file output shows external ids
+    let n_docs = mi.ids.len();
+    let delta = mi.delta.read().map_err(|e| e.to_string())?;
 
     let queries = read_seismic_bin(&args.queries, args.n_queries)?;
     if queries.is_empty() {
         return Err("there are no queries to run".into());
     }
 
-    let n_docs = index.graph.len() / MAX_GRAPH_DEGREE;
     let mut visited = Visited {
         counter: 0,
         visited: vec![0; n_docs],
@@ -250,16 +282,21 @@ fn run_search(args: SearchArgs) -> Result<(), Box<dyn Error>> {
     let t = Instant::now();
     let mut dense = vec![0; args.vocab_size];
     let mut dense_rescoring = vec![0_f32; args.vocab_size];
+    let mut delta_acc = vec![0_f32; MAX_DELTA];
     for q in &queries {
-        results.push(search(
+        results.push(search_all(
             q,
-            &vectors_and_sketches,
-            &index,
-            make_params()?,
+            &mi.vectors_and_sketches,
+            &mi.index_output,
+            &make_params()?,
             &mut visited,
             &mut dense,
             &mut dense_rescoring,
-            &mmap,
+            &mi.vectors_mmap,
+            &mi.tombstones,
+            n_docs as u32,
+            &delta,
+            &mut delta_acc,
         )?);
     }
     let elapsed = t.elapsed();
@@ -274,13 +311,13 @@ fn run_search(args: SearchArgs) -> Result<(), Box<dyn Error>> {
         let mut out = std::io::BufWriter::new(File::create(path)?);
         for (qi, found) in results.iter().enumerate() {
             for (doc, score) in found {
-                writeln!(out, "{qi}\t{doc}\t{score}")?;
+                writeln!(out, "{qi}\t{}\t{score}", mi.external_id(*doc))?;
             }
         }
     }
 
     if args.recall {
-        let raw = decode_sparse_vectors_raw(&mmap, None)?;
+        let raw = decode_sparse_vectors_raw(&mi.vectors_mmap, None)?;
         let docs = raw
             .iter()
             .map(|v| {
@@ -297,6 +334,7 @@ fn run_search(args: SearchArgs) -> Result<(), Box<dyn Error>> {
             let mut exact: Vec<(f32, u32)> = docs
                 .iter()
                 .enumerate()
+                .filter(|(i, _)| !mi.tombstones.is_deleted(*i as u32))
                 .map(|(i, d)| (q.dot(d), i as u32))
                 .collect();
             if exact.len() > k {
@@ -319,9 +357,90 @@ fn run_search(args: SearchArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn run_delete(args: DeleteArgs) -> Result<(), Box<dyn Error>> {
+    let mi = MutableIndex::from_env(&args.index_dir, args.vocab_size, false)?;
+    let dir = mi.dir(&args.index_dir);
+    let n_delta = mi.delta.read().map_err(|e| e.to_string())?.docs.len();
+    let n_docs = mi.ids.len() + n_delta;
+
+    // the user gives external ids: turn them all into internal ids first,
+    // so a bad id does not leave a half-applied deletion
+    let mut internal_ids = Vec::with_capacity(args.ids.len());
+    for id in &args.ids {
+        match mi.internal_id(*id, n_delta) {
+            Some(internal) => internal_ids.push(internal),
+            None => return Err(format!("document id {id} does not exist in the index").into()),
+        }
+    }
+
+    let (mut deleted, mut already_deleted) = (0, 0);
+    for internal in internal_ids {
+        if delete(internal, &mi.tombstones, &dir, n_docs)? {
+            deleted += 1
+        } else {
+            already_deleted += 1
+        }
+    }
+    eprintln!("deleted {deleted} documents ({already_deleted} were already deleted)");
+
+    Ok(())
+}
+
+fn run_update(args: UpdateArgs) -> Result<(), Box<dyn Error>> {
+    let mi = MutableIndex::from_env(&args.index_dir, args.vocab_size, false)?;
+    let dir = mi.dir(&args.index_dir);
+    let new_docs = read_seismic_bin(&args.documents, args.n_documents)?;
+
+    // check everything first, so a bad document does not leave a half-applied update
+    if let Some(term) = new_docs
+        .iter()
+        .flat_map(|v| v.indices.iter())
+        .find(|&&t| t as usize >= args.vocab_size)
+    {
+        return Err(format!(
+            "term id {term} is out of range: the vocabulary size is {}",
+            args.vocab_size
+        )
+        .into());
+    }
+
+    let existing = mi.delta.read().map_err(|e| e.to_string())?.docs.len();
+    if existing + new_docs.len() > MAX_DELTA {
+        return Err(format!(
+            "the delta holds {existing} documents and the limit is {MAX_DELTA}: cannot add {} more",
+            new_docs.len()
+        )
+        .into());
+    }
+
+    let t = Instant::now();
+    let mut ids: Vec<u32> = Vec::with_capacity(new_docs.len());
+    for v in new_docs {
+        ids.push(persist_delta_insert(
+            v.indices,
+            v.values,
+            &mi.delta,
+            &dir,
+            mi.ext_base,
+        )?);
+    }
+    match (ids.first(), ids.last()) {
+        (Some(first), Some(last)) => eprintln!(
+            "added {} documents with ids {first}..={last} in {:.1?}",
+            ids.len(),
+            t.elapsed()
+        ),
+        _ => eprintln!("there are no documents to add"),
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     match Cli::parse().command {
         Command::Build(args) => run_build(args),
         Command::Search(args) => run_search(args),
+        Command::Delete(args) => run_delete(args),
+        Command::Update(args) => run_update(args),
     }
 }

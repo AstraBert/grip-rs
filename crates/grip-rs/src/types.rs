@@ -87,6 +87,13 @@ impl SparseVector {
         Ok(SparseVector { indices, values })
     }
 
+    pub fn from_id_value_pairs_unchecked(v: &Vec<(u32, f32)>) -> Self {
+        Self {
+            indices: v.iter().map(|v| v.0).collect(),
+            values: v.iter().map(|v| v.1).collect(),
+        }
+    }
+
     pub fn is_optimal(&self) -> bool {
         self.indices.len() == self.values.len()
             && !self.values.iter().any(|v| *v == 0_f32 || v.is_nan())
@@ -219,6 +226,17 @@ impl SparseVector {
 
         QuantizedSparseVector::new(indices, values)
     }
+
+    pub fn quantize_unchecked(&self, scale: f32) -> QuantizedSparseVector {
+        let indices = self.indices.clone();
+        let mut values: Vec<u8> = vec![];
+        for v in self.values.iter() {
+            let q = (*v / scale).round().min(255_f32);
+            values.push(q as u8);
+        }
+
+        QuantizedSparseVector::new_unchecked(indices, values)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,6 +246,10 @@ pub struct QuantizedSparseVector {
 }
 
 impl QuantizedSparseVector {
+    pub fn new_unchecked(indices: Vec<u32>, values: Vec<u8>) -> Self {
+        Self { indices, values }
+    }
+
     pub fn new(indices: Vec<u32>, values: Vec<u8>) -> Result<Self, String> {
         if indices.len() != values.len() {
             return Err(format!(
@@ -278,6 +300,13 @@ impl QuantizedSparseVector {
         self.indices.truncate(dim);
         self.values.truncate(dim);
     }
+
+    pub fn from_slices_unchecked(i: &[u32], v: &[u8]) -> Self {
+        Self {
+            indices: i.to_vec(),
+            values: v.to_vec(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -298,6 +327,23 @@ pub struct BuildParams {
 }
 
 impl BuildParams {
+    pub fn from_defaults(vocab_size: usize) -> Self {
+        Self {
+            vocab_size,
+            m: 12,
+            seed: 42,
+            leaf_k: 8,
+            refine: true,
+            robust_prune_alpha: 1.0,
+            entrypoint_seeds: 64,
+            sketch_size: 80,
+            fanouts: [3, 2],
+            refinement_ef: Some(100),
+            refinement_patience: Some(20),
+            refinement_query_dims: Some(2),
+        }
+    }
+
     pub fn new(
         m: usize,
         seed: u64,
@@ -369,6 +415,18 @@ pub struct SearchParams {
     pub top_k: usize,
     pub ef: usize,
     pub rescore_factor: usize,
+}
+
+impl Default for SearchParams {
+    fn default() -> Self {
+        Self {
+            max_query_dims: 2,
+            patience: 20,
+            top_k: 10,
+            rescore_factor: 5,
+            ef: 100,
+        }
+    }
 }
 
 impl SearchParams {

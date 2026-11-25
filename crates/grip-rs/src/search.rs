@@ -4,8 +4,10 @@ use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    delta::{Delta, delta_search},
     disk::decode_sparse_vectors_raw,
     seeding::SeedVecs,
+    tombstone::Tombstones,
     types::{QuantizedSparseVector, SearchParams, SparseVector, SparseVectorSortKey},
 };
 
@@ -125,6 +127,7 @@ pub fn run_beam_search(
     graph: &[u32],
     ef: usize,
     patience: usize,
+    tombstones: &Tombstones,
 ) -> Result<Vec<(Reverse<u32>, u32)>, String> {
     let mut candidates: BinaryHeap<(u32, u32)> = BinaryHeap::new();
     let mut results: BinaryHeap<(Reverse<u32>, u32)> = BinaryHeap::new();
@@ -143,7 +146,9 @@ pub fn run_beam_search(
             score += *w as u32 * dense[*i as usize] as u32;
         }
         candidates.push((score, e));
-        maybe_add_result(&mut results, ef, score, e);
+        if !tombstones.is_deleted(e) {
+            maybe_add_result(&mut results, ef, score, e);
+        }
     }
     let mut no_change = 0;
 
@@ -164,6 +169,14 @@ pub fn run_beam_search(
                 let sketch = sketch.unwrap();
                 for (i, w) in sketch.0.iter().zip(sketch.1.iter()) {
                     score += *w as u32 * dense[*i as usize] as u32;
+                }
+                if tombstones.is_deleted(*nb) {
+                    // only add to candidates if it is good enough to enter
+                    // results pool
+                    if results.len() < ef || results.peek().unwrap().0.0 < score {
+                        candidates.push((score, *nb));
+                    }
+                    continue;
                 }
                 let added = maybe_add_result(&mut results, ef, score, *nb);
                 if added {
@@ -231,11 +244,12 @@ pub fn search(
     query: &SparseVector,
     vectors_and_sketches: &VectorsAndSketches,
     index_output: &IndexOutput,
-    params: SearchParams,
+    params: &SearchParams,
     visited: &mut Visited,
     dense: &mut Vec<u8>,
     dense_rescoring: &mut Vec<f32>,
     sparse_vectors_mmap: &Mmap,
+    tombstones: &Tombstones,
 ) -> Result<Vec<(u32, f32)>, String> {
     let q8 = query.quantize(vectors_and_sketches.scale)?;
     for (t, w) in q8.indices.iter().zip(q8.values.iter()) {
@@ -257,6 +271,7 @@ pub fn search(
         &index_output.graph,
         params.ef,
         params.patience,
+        tombstones,
     )?;
     let mut ids = res.iter().map(|v| v.1).collect();
     rescore(
@@ -266,4 +281,43 @@ pub fn search(
         dense_rescoring,
         &params,
     )
+}
+
+pub fn search_all(
+    query: &SparseVector,
+    vectors_and_sketches: &VectorsAndSketches,
+    index_output: &IndexOutput,
+    params: &SearchParams,
+    visited: &mut Visited,
+    dense: &mut Vec<u8>,
+    dense_rescoring: &mut Vec<f32>,
+    sparse_vectors_mmap: &Mmap,
+    tombstones: &Tombstones,
+    delta_base: u32,
+    delta: &Delta,
+    delta_acc: &mut Vec<f32>,
+) -> Result<Vec<(u32, f32)>, String> {
+    let mut hits = search(
+        query,
+        vectors_and_sketches,
+        index_output,
+        params,
+        visited,
+        dense,
+        dense_rescoring,
+        sparse_vectors_mmap,
+        tombstones,
+    )?;
+    let mut delta_hits = delta_search(
+        delta,
+        query,
+        params.top_k,
+        tombstones,
+        delta_base,
+        delta_acc,
+    );
+    hits.append(&mut delta_hits);
+    hits.sort_by(|a, b| b.1.total_cmp(&a.1));
+    hits.truncate(params.top_k);
+    Ok(hits)
 }

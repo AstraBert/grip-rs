@@ -22,7 +22,7 @@ fn random_sample<T: Clone, R: Rng + ?Sized>(pool: &[T], size: usize, mut rng: &m
     sampled
 }
 
-fn build_inverted_index(
+pub fn build_inverted_index(
     vectors: &[&SparseVector],
     points: &[u32],
 ) -> HashMap<u32, Vec<(u32, f32)>> {
