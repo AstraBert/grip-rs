@@ -4,3 +4,4 @@ crates/grip-rs/data/
 msmarco-*-index/
 presentation/
 results/
+__pycache__/

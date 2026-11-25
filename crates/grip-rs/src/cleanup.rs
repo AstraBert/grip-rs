@@ -209,8 +209,8 @@ impl CleanupParams {
     pub fn from_defaults(vocab_size: usize) -> Self {
         Self {
             robust_prune_alpha: 1.0,
-            max_border_length: 200,
-            max_dfs: 100,
+            max_border_length: 2000,
+            max_dfs: 1000,
             vocab_size,
             sketch_size: 80,
             ef: 100,

@@ -31,8 +31,7 @@ const MAX_EF: usize = 500;
 const MAX_TOP_K: usize = 100;
 const CLEANUP_THRESHOLD: f64 = 0.5;
 
-#[derive(Debug, Clone, Copy)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, Default)]
 enum LogLevel {
     Error,
     Warn,
@@ -40,7 +39,6 @@ enum LogLevel {
     Info,
     Debug,
 }
-
 
 impl FromStr for LogLevel {
     type Err = String;
@@ -138,10 +136,10 @@ struct CleanupArgs {
     #[arg(long, default_value_t = 1.0)]
     cleanup_alpha: f32,
     /// Maximum number of nodes visited by the healer around a deleted node
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 1000)]
     cleanup_max_dfs: usize,
     /// Maximum size of the border the healer collects around a deleted node
-    #[arg(long, default_value_t = 200)]
+    #[arg(long, default_value_t = 2000)]
     cleanup_max_border_length: usize,
     /// Number of components kept in the routing sketch of a delta document
     #[arg(long, default_value_t = 80)]
@@ -220,10 +218,12 @@ impl SearchRequest {
 
     // always call after resolve()
     fn validate(&self) -> Result<(), String> {
-        if [self.top_k,
+        if [
+            self.top_k,
             self.ef,
             self.max_query_dims,
-            self.rescore_factor]
+            self.rescore_factor,
+        ]
         .iter()
         .any(|v| v.is_none())
         {
@@ -355,9 +355,7 @@ async fn post_search(
     let mut request = request.into_inner();
 
     request.resolve();
-    request
-        .validate()
-        .map_err(SearchError::ValidationError)?;
+    request.validate().map_err(SearchError::ValidationError)?;
 
     if request
         .vector
@@ -673,8 +671,7 @@ async fn main() -> Result<(), String> {
                     let delta_len = delta_m.docs.len();
                     let n_docs = mi_read.ids.len() + delta_len;
                     drop(delta_m);
-                    if mi_read.tombstones.ratio(n_docs) < CLEANUP_THRESHOLD
-                        || delta_len >= MAX_DELTA
+                    if mi_read.tombstones.ratio(n_docs) < CLEANUP_THRESHOLD && delta_len < MAX_DELTA
                     {
                         drop(mi_read);
                         continue;

@@ -15,7 +15,10 @@ if the index was built from the first N documents, documents N, N+1, ... are ins
 So the id of a document is also its row in the documents file, and it must stay that way
 after the cleanup.
 
-The steps:
+Two scenarios (--scenario): "deletes" crosses the deleted-ratio threshold, and "delta" fills
+the delta with inserts and no deletions. Both must start a cleanup.
+
+Scenario "deletes", the steps:
   1. Insert a few documents.
   2. Delete 45 percent of the documents. This is below the cleanup threshold: nothing happens.
   3. Delete 10 percent more. The threshold (half of the documents) is crossed, and the
@@ -35,7 +38,12 @@ that holds symlinks to the index files. The server writes the new versions next 
 
 --index-dir can be the folder written by `build` (a v0 folder inside) or an old flat folder.
 
-Keep these in sync with grip-server: the cleanup threshold (0.5) and the check interval (10 s).
+Scenario "delta": insert --delta-fill documents (the size of a full delta), check that the next
+insert is refused (507), wait for v1, then check that nothing was lost, that the delta takes
+inserts again with the next id, and that a restart gives the same state.
+
+Keep these in sync with grip-server: the cleanup threshold (0.5), the check interval (10 s), and
+the delta size that starts a cleanup.
 
 Build the server first: cargo build --release -p grip-server
 """
@@ -64,6 +72,7 @@ from check_updates import (
 )
 
 CLEANUP_THRESHOLD = 0.5  # keep in sync with CLEANUP_THRESHOLD in grip-server
+MAX_DELTA = 50_000  # keep in sync with grip_rs::delta::MAX_DELTA: the delta size that triggers a cleanup
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,9 +91,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rescore-factor", type=int, default=5)
     p.add_argument("--insert-percent", type=float, default=2, help="documents inserted before the deletions")
     p.add_argument("--late-inserts", type=int, default=2000, help="most documents inserted during the cleanup")
+    p.add_argument("--delta-fill", type=int, default=MAX_DELTA, help="documents inserted by the delta scenario")
+    p.add_argument("--scenario", choices=["deletes", "delta", "all"], default="all")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--startup-timeout", type=float, default=120.0)
-    p.add_argument("--cleanup-timeout", type=float, default=180.0)
+    p.add_argument("--cleanup-timeout", type=float, default=600.0)
     return p.parse_args()
 
 
@@ -159,7 +170,7 @@ async def alive_count(client: httpx.AsyncClient) -> tuple[int, dict]:
     return n - round(info["deleted_ratio"] * n), info
 
 
-async def main_async(args: argparse.Namespace, workdir: Path, server: Server, source_dir: Path) -> bool:
+async def deletes_scenario(args: argparse.Namespace, workdir: Path, server: Server, source_dir: Path) -> bool:
     n_main = documents_in_index(source_dir)
     n_init = round(n_main * args.insert_percent / 100)
     n_rows = n_main + n_init + args.late_inserts + 2
@@ -296,24 +307,121 @@ async def main_async(args: argparse.Namespace, workdir: Path, server: Server, so
     return ok
 
 
+async def delta_scenario(args: argparse.Namespace, workdir: Path, server: Server, source_dir: Path) -> bool:
+    """A full delta starts a cleanup, with no deletions at all."""
+    n_main = documents_in_index(source_dir)
+    n_fill = args.delta_fill
+    n_rows = n_main + n_fill + 2
+    all_docs = read_seismic(args.documents, args.vocab_size, n_rows)
+    if all_docs.shape[0] < n_rows:
+        raise SystemExit(
+            f"the documents file has {all_docs.shape[0]} documents and {n_rows} are needed: the index "
+            f"({n_main}), --delta-fill ({n_fill}) and 2 more"
+        )
+    queries = read_seismic(args.queries, args.vocab_size, args.n_queries)
+    docs_t = all_docs.T.tocsc()
+    print(f"{n_main} indexed documents, {n_fill} inserted, {queries.shape[0]} queries\n")
+
+    ok = True
+
+    def report(name: str, good: bool, detail: str = "") -> None:
+        nonlocal ok
+        ok &= good
+        print(f"  {name}{': ' + detail if detail else ''} {'ok' if good else 'FAIL'}")
+
+    server.start()
+    async with httpx.AsyncClient(base_url=server.url, timeout=120) as client:
+        print("Filling the delta")
+        start = time.time()
+        await insert_docs(client, all_docs, range(n_main, n_main + n_fill), n_main)
+        total = n_main + n_fill
+        ledger = Ledger(total)
+        print(f"  inserted {n_fill} documents in {time.time() - start:.0f} s")
+
+        full = (await client.post("/points", json=row_json(all_docs, total))).status_code
+        report("an insert into a full delta is refused", full == 507, f"{full}, expected 507")
+
+        n_alive, info = await alive_count(client)
+        report("/info counts the delta", n_alive == total and info["deleted_ratio"] == 0, f"{n_alive} documents")
+        results, _ = await run_queries(client, queries, args)
+        truth = exact_top_k(queries, docs_t, ledger.mask(n_rows), args.top_k)
+        before = recall(results, truth)
+        print(f"  recall before the cleanup: {before:.4f}")
+
+        print("\nDuring the cleanup")
+        stop = asyncio.Event()
+        r = asyncio.create_task(reader(client, queries, args, stop))
+        start = time.time()
+        while not (workdir / "v1").exists() and time.time() - start < args.cleanup_timeout:
+            await asyncio.sleep(0.5)
+        appeared = (workdir / "v1").exists()
+        await asyncio.sleep(1.0)
+        stop.set()
+        n_searches, r_errors, slowest = await r
+        report("the new version v1 appeared", appeared, f"{time.time() - start:.0f} s")
+        report("no leftover v1.tmp", not (workdir / "v1.tmp").exists())
+        report("no search failed", not r_errors,
+               f"{n_searches} searches, slowest {slowest:.0f} ms" if not r_errors else r_errors[0])
+        if not appeared:
+            return False
+
+        print("\nAfter the cleanup")
+        n_alive, info = await alive_count(client)
+        report("/info: every document is there, none deleted", n_alive == total and info["deleted_ratio"] == 0,
+               f"{n_alive} documents, ratio {info['deleted_ratio']}")
+        results, _ = await run_queries(client, queries, args)
+        unknown = sum(1 for res in results for i in res if i not in ledger.alive)
+        truth = exact_top_k(queries, docs_t, ledger.mask(n_rows), args.top_k)
+        after = recall(results, truth)
+        report("only known ids in the results", unknown == 0, f"{unknown} unknown")
+        report("the recall holds", after >= before - 0.03, f"{before:.4f} -> {after:.4f}")
+
+        row = ledger.next_row
+        resp = await client.post("/points", json=row_json(all_docs, row))
+        got = resp.json().get("external_id") if resp.status_code == 201 else None
+        report("the delta accepts inserts again, with the next id", got == row,
+               f"{resp.status_code}, id {got}, expected 201 and {row}")
+        ledger.next_row += 1
+        ledger.alive.add(row)
+        results, _ = await run_queries(client, queries, args)
+        info_before = (await client.get("/info")).json()
+
+    print("\nAfter a restart")
+    server.stop()
+    server.start()
+    async with httpx.AsyncClient(base_url=server.url, timeout=120) as client:
+        info_after = (await client.get("/info")).json()
+        after_results, _ = await run_queries(client, queries, args)
+        report("/info is the same", info_after == info_before)
+        report("search results are identical", after_results == results)
+    return ok
+
+
 def main() -> None:
     args = parse_args()
     if not args.server_bin.exists():
         raise SystemExit(f"{args.server_bin} not found. Build it with: cargo build --release -p grip-server")
 
     source_dir = args.index_dir / "v0" if (args.index_dir / "v0").is_dir() else args.index_dir
-    with tempfile.TemporaryDirectory(prefix="grip-cleanup-") as tmp:
-        workdir = Path(tmp)
-        (workdir / "v0").mkdir()
-        for name in INDEX_FILES:
-            (workdir / "v0" / name).symlink_to((source_dir / name).resolve())
-        server = Server(args.server_bin.resolve(), workdir, args.vocab_size, args.port, args.startup_timeout)
-        try:
-            ok = asyncio.run(main_async(args, workdir, server, source_dir))
-        finally:
-            server.stop()
+    scenarios = {"deletes": deletes_scenario, "delta": delta_scenario}
+    chosen = list(scenarios) if args.scenario == "all" else [args.scenario]
 
-    print("\nPASS" if ok else "\nFAIL")
+    ok = True
+    for name in chosen:
+        print(f"===== scenario: {name} =====")
+        with tempfile.TemporaryDirectory(prefix="grip-cleanup-") as tmp:
+            workdir = Path(tmp)
+            (workdir / "v0").mkdir()
+            for f in INDEX_FILES:
+                (workdir / "v0" / f).symlink_to((source_dir / f).resolve())
+            server = Server(args.server_bin.resolve(), workdir, args.vocab_size, args.port, args.startup_timeout)
+            try:
+                ok &= asyncio.run(scenarios[name](args, workdir, server, source_dir))
+            finally:
+                server.stop()
+        print()
+
+    print("PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 
 
