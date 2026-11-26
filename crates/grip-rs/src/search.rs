@@ -214,6 +214,7 @@ pub fn rescore(
     let vectors = decode_sparse_vectors_raw(
         sparse_vectors_mmap,
         Some(ids.iter().map(|&i| i as usize).collect()),
+        false,
     )?;
 
     // reset dense for reuse

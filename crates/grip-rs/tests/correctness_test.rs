@@ -3,7 +3,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{BufReader, Read, Write},
     path::{Path, PathBuf},
-    sync::RwLock,
+    sync::{Arc, RwLock},
 };
 
 use grip_rs::{
@@ -203,7 +203,7 @@ fn test_unmodified_index_recall() {
         );
     }
 
-    let raw = decode_sparse_vectors_raw(&mmap, None).expect("Should decode vectors");
+    let raw = decode_sparse_vectors_raw(&mmap, None, false).expect("Should decode vectors");
     let docs = raw
         .iter()
         .map(|v| {
@@ -278,7 +278,7 @@ fn test_tombstone_deletions() {
             .map(|t| *t)
             .collect();
 
-        let raw = decode_sparse_vectors_raw(&mmap, None).expect("Should decode vectors");
+        let raw = decode_sparse_vectors_raw(&mmap, None, false).expect("Should decode vectors");
         let docs = raw
             .iter()
             .map(|v| {
@@ -889,7 +889,7 @@ fn compact_any(
     let (n_live, returned_ext_base) = compact(
         dir.path(),
         tombstones,
-        delta,
+        &delta.docs,
         ext_base_in,
         ids_in,
         mmap_in,
@@ -955,7 +955,7 @@ fn test_compact_merges_delta_and_drops_deleted() {
         .main
         .iter()
         .cloned()
-        .chain(delta.docs.iter().cloned())
+        .chain(delta.docs.iter().map(|d| (**d).clone()))
         .collect();
 
     for deletion in [None, Some((5, 2)), Some((2, 0))] {
@@ -991,7 +991,7 @@ fn test_compact_merges_delta_and_drops_deleted() {
         assert_eq!(c.sketches.offsets.len(), c.n_live + 1, "{label}: sketches");
 
         // vectors and sketches follow the renumbering
-        let raw = decode_sparse_vectors_raw(&c.mmap, None).expect("Should decode");
+        let raw = decode_sparse_vectors_raw(&c.mmap, None, false).expect("Should decode");
         assert_eq!(raw.len(), c.n_live, "{label}");
         for (new, old) in c.ids.iter().enumerate() {
             let doc = &all_docs[*old as usize];
@@ -1159,7 +1159,7 @@ fn test_compact_when_every_main_document_is_deleted() {
 
     let mut delta = Delta::default();
     for v in &env.extra {
-        delta_insert(&mut delta, v.clone());
+        delta_insert(&mut delta, Arc::new(v.clone()));
     }
     let tombstones = Tombstones::with_capacity(total);
     for id in 0..N_MAIN as u32 {
@@ -1183,7 +1183,7 @@ fn test_compact_when_every_main_document_is_deleted() {
     assert_eq!(c.ext_base, total as u32);
     assert_eq!(c.sketches.offsets.len(), n_delta + 1);
 
-    let raw = decode_sparse_vectors_raw(&c.mmap, None).expect("Should decode");
+    let raw = decode_sparse_vectors_raw(&c.mmap, None, false).expect("Should decode");
     assert_eq!(raw.len(), n_delta);
     for (new, doc) in delta.docs.iter().enumerate() {
         let got_indices: Vec<u32> = raw[new].iter().map(|x| x.0).collect();
@@ -1200,7 +1200,10 @@ fn test_compact_when_every_main_document_is_deleted() {
     println!("only delta: {with_edges} of {n_delta} documents have a neighbor");
 
     // search: the oracle holds the delta documents, with the new ids
-    let oracle = Oracle::new(delta.docs.clone(), VOCAB_SIZE);
+    let oracle = Oracle::new(
+        delta.docs.iter().map(|d| (**d).clone()).collect(),
+        VOCAB_SIZE,
+    );
     let none = Tombstones::with_capacity(0);
     let results = search_index(&env.queries, &c.sketches, &c.index, &c.mmap, n_delta, &none);
     let recall = mean_recall(&env.queries, &results, &oracle, k);
@@ -1223,13 +1226,13 @@ fn test_compact_twice() {
     // round 1: some documents are deleted, the delta is merged
     let mut delta1 = Delta::default();
     for v in &env.extra {
-        delta_insert(&mut delta1, v.clone());
+        delta_insert(&mut delta1, Arc::new(v.clone()));
     }
     let all_docs: Vec<SparseVector> = env
         .main
         .iter()
         .cloned()
-        .chain(delta1.docs.iter().cloned())
+        .chain(delta1.docs.iter().map(|d| (**d).clone()))
         .collect();
     let (tombstones1, deleted1) = tombstones_for(total, 5, 2);
     let c1 = compact_any(
@@ -1248,7 +1251,7 @@ fn test_compact_twice() {
     // round 2: new documents, and deletions over the internal ids of round 1
     let mut delta2 = Delta::default();
     for q in env.queries.iter().take(100) {
-        delta_insert(&mut delta2, q.clone());
+        delta_insert(&mut delta2, Arc::new(q.clone()));
     }
     let n_delta2 = delta2.docs.len();
     let (tombstones2, deleted2) = tombstones_for(n1 + n_delta2, 3, 1);
@@ -1298,7 +1301,7 @@ fn test_compact_twice() {
             &delta2.docs[(ext - c1.ext_base) as usize]
         }
     };
-    let raw = decode_sparse_vectors_raw(&c2.mmap, None).expect("Should decode");
+    let raw = decode_sparse_vectors_raw(&c2.mmap, None, false).expect("Should decode");
     assert_eq!(raw.len(), c2.n_live);
     for (new, ext) in c2.ids.iter().enumerate() {
         let doc = doc_of(*ext);
@@ -1315,7 +1318,7 @@ fn test_compact_twice() {
         all_docs
             .iter()
             .cloned()
-            .chain(delta2.docs.iter().cloned())
+            .chain(delta2.docs.iter().map(|d| (**d).clone()))
             .collect(),
         VOCAB_SIZE,
     );

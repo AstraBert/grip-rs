@@ -2,20 +2,21 @@ use std::{
     fs,
     mem::DropGuard,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    ptr::replace,
+    sync::{Arc, RwLock, atomic::Ordering},
 };
 
-use memmap2::Mmap;
+use memmap2::{Advice, Mmap};
 
 use crate::{
-    IndexOutput, VectorsAndSketches,
+    IndexOutput, SparseVector, VectorsAndSketches,
     compact::{
         COMPACT_IDS_FILE, COMPACT_INDEX_FILE, COMPACT_SKETCHES_FILE, COMPACT_VECTORS_FILE, compact,
     },
-    delta::{Delta, MAX_DELTA, load_delta, persist_delta_insert},
+    delta::{Delta, MAX_DELTA, load_delta, persist_batch_inserts},
     healer::heal,
     read_index, read_sketches,
-    tombstone::{Tombstones, delete, load_tombstones},
+    tombstone::{Tombstones, delete_batch, load_tombstones},
 };
 
 #[derive(Debug)]
@@ -178,6 +179,17 @@ impl MutableIndex {
         *self = Self::load_from(index_dir, vocab_size)?;
         Ok(())
     }
+
+    pub fn copy_from(&mut self, other: Self) {
+        self.delta = other.delta;
+        self.ext_base = other.ext_base;
+        self.ids = other.ids;
+        self.index_output = other.index_output;
+        self.tombstones = other.tombstones;
+        self.vectors_mmap = other.vectors_mmap;
+        self.vectors_and_sketches = other.vectors_and_sketches;
+        self.version = other.version;
+    }
 }
 
 // function cleanup(shared, base_dir):
@@ -228,8 +240,8 @@ pub fn cleanup(
 ) -> Result<(), String> {
     let rlock_mi = mutable_index.read().map_err(|e| e.to_string())?;
     let rlock_delta = rlock_mi.delta.read().map_err(|e| e.to_string())?;
-    let delta_snap = rlock_delta.clone();
-    let delta_snap_len = delta_snap.docs.len();
+    let delta_snap = rlock_delta.docs.clone();
+    let delta_snap_len = delta_snap.len();
     drop(rlock_delta);
     let tombstones_snap = rlock_mi.tombstones.make_copy();
     let healed = heal(
@@ -276,6 +288,7 @@ pub fn cleanup(
 
     drop(rlock_mi);
 
+    let new = MutableIndex::load_from(&index_dir_tmp, params.vocab_size)?;
     let snap_total = n_main_old + delta_snap_len;
     let mut old_to_new = vec![None; snap_total];
     let mut n_live = 0_usize;
@@ -290,51 +303,57 @@ pub fn cleanup(
     // add or delete anything while
     // backfilling intermediate updates
     // and deletions
-    let new_delta = RwLock::new(Delta::default());
-    let new_tombstones = Tombstones::with_capacity(n_main_new + MAX_DELTA);
     let mut wlocked_mi = mutable_index.write().map_err(|e| e.to_string())?;
-    let rlocked_old_delta = wlocked_mi.delta.read().map_err(|e| e.to_string())?.clone();
+    let rlocked_old_delta = wlocked_mi.delta.read().map_err(|e| e.to_string())?;
     let old_tombstones = wlocked_mi.tombstones.make_copy();
-    for i in delta_snap_len..rlocked_old_delta.docs.len() {
-        let vector = rlocked_old_delta.docs[i].clone();
-        persist_delta_insert(
-            vector.indices,
-            vector.values,
-            &new_delta,
-            &index_dir_tmp,
-            new_ext_base,
-        )
+    let vectors_to_insert = (delta_snap_len..rlocked_old_delta.docs.len())
+        .map(|i| rlocked_old_delta.docs[i].clone())
+        .collect::<Vec<Arc<SparseVector>>>();
+    persist_batch_inserts(vectors_to_insert, &new.delta, &index_dir_tmp, new_ext_base)
         .map_err(|e| e.to_string())?;
-    }
 
-    for old_internal in 0..(n_main_old + rlocked_old_delta.docs.len()) {
-        if !old_tombstones.is_deleted(old_internal as u32) {
-            continue;
-        }
-        if old_internal < snap_total && tombstones_snap.is_deleted(old_internal as u32) {
-            continue; // already dropped in compaction
-        }
-        let new_internal = if old_internal < n_main_old + delta_snap_len {
-            old_to_new[old_internal].unwrap()
-        } else {
-            let pos = old_internal - n_main_old;
-            n_main_new + (pos - delta_snap_len)
-        };
+    let deleted_ids = old_tombstones
+        .words
+        .iter()
+        .enumerate()
+        .map(|(w, cur_unloaded)| {
+            let snap = tombstones_snap.words[w].load(Ordering::Relaxed);
+            let cur = cur_unloaded.load(Ordering::Relaxed);
+            let mut new_bits = cur & !snap;
+            let mut ids_int = vec![];
+            while new_bits != 0 {
+                let bit = new_bits.trailing_zeros();
+                let old_internal = w as u32 * 64 + bit;
+                ids_int.push(old_internal);
+                new_bits &= new_bits - 1;
+            }
 
-        delete(
-            new_internal as u32,
-            &new_tombstones,
-            &index_dir_tmp,
-            n_main_new + rlocked_old_delta.docs.len() - delta_snap_len,
-        )
+            ids_int
+        })
+        .flatten()
+        .collect::<Vec<u32>>();
+
+    let current_docs = n_main_new + rlocked_old_delta.docs.len() - delta_snap_len;
+
+    delete_batch(&deleted_ids, &new.tombstones, &index_dir_tmp, current_docs)
         .map_err(|e| e.to_string())?;
-    }
+
+    #[cfg(target_family = "unix")]
+    new.vectors_mmap
+        .advise(Advice::WillNeed)
+        .map_err(|e| e.to_string())?;
 
     fs::rename(&*index_dir_tmp, &index_dir).map_err(|e| e.to_string())?;
 
-    wlocked_mi.reload(&index_dir, params.vocab_size)?;
+    drop(rlocked_old_delta);
+
+    let old;
+    unsafe {
+        old = replace(&mut *wlocked_mi, new);
+    }
 
     drop(wlocked_mi);
+    drop(old);
 
     Ok(())
 }

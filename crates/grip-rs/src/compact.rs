@@ -1,11 +1,10 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::Arc};
 
 use memmap2::Mmap;
 
 use crate::{
     IndexOutput, QuantizedSparseVector, SparseVector, VectorsAndSketches, Visited,
     compute_entry_points,
-    delta::Delta,
     disk::decode_sparse_vectors_raw,
     make_routing_sketch,
     robustprune::{MAX_GRAPH_DEGREE, robust_prune},
@@ -55,7 +54,7 @@ fn pack_sketches(sketches: &[QuantizedSparseVector], scale: f32) -> VectorsAndSk
 pub fn compact(
     out_dir: &Path,
     tombstones: &Tombstones,
-    delta: &Delta,
+    delta: &[Arc<SparseVector>],
     ext_base: u32,
     old_ids: &[u32],
     vectors_mmap: &Mmap,
@@ -86,7 +85,7 @@ pub fn compact(
     }
 
     // 1. renumbering table: ext id (main, then delta) -> internal id
-    let n = n_main + delta.docs.len();
+    let n = n_main + delta.len();
     let mut ext_to_internal: Vec<Option<u32>> = vec![None; n];
     let mut n_live = 0usize;
     for ext in 0..n {
@@ -103,7 +102,7 @@ pub fn compact(
     let live_main: Vec<usize> = (0..n_main)
         .filter(|o| ext_to_internal[*o].is_some())
         .collect();
-    let main_raw = decode_sparse_vectors_raw(vectors_mmap, Some(live_main.clone()))?;
+    let main_raw = decode_sparse_vectors_raw(vectors_mmap, Some(live_main.clone()), false)?;
 
     let mut internal_vectors: Vec<SparseVector> = Vec::with_capacity(n_live);
     let mut internal_sketches: Vec<QuantizedSparseVector> = Vec::with_capacity(n_live);
@@ -121,13 +120,13 @@ pub fn compact(
             continue;
         }
         // delta documents have no sketch yet
-        let vector = delta.docs[ext - n_main].clone();
+        let vector = delta[ext - n_main].clone();
         internal_sketches.push(make_routing_sketch(
             &vector,
             sketch_size,
             vectors_and_sketches.scale,
         )?);
-        internal_vectors.push(vector);
+        internal_vectors.push(vector.as_ref().to_owned());
     }
 
     // 3. graph rows of the main documents: translate ids, drop deleted ones,
@@ -265,7 +264,7 @@ pub fn compact(
             };
         }
     }
-    let new_ext_base = ext_base + delta.docs.len() as u32;
+    let new_ext_base = ext_base + delta.len() as u32;
     let mut full_ids_bytes = new_ext_base.to_le_bytes().to_vec();
     full_ids_bytes.extend(ids.iter().flat_map(|i| i.to_le_bytes()));
 

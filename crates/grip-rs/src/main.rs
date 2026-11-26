@@ -317,7 +317,7 @@ fn run_search(args: SearchArgs) -> Result<(), Box<dyn Error>> {
     }
 
     if args.recall {
-        let raw = decode_sparse_vectors_raw(&mi.vectors_mmap, None)?;
+        let raw = decode_sparse_vectors_raw(&mi.vectors_mmap, None, false)?;
         let docs = raw
             .iter()
             .map(|v| {

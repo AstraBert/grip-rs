@@ -3,9 +3,9 @@ use std::{
     error::Error,
     fmt::Display,
     fs,
-    io::{self, Write},
+    io::{self, BufWriter, Write},
     path::Path,
-    sync::RwLock,
+    sync::{Arc, RwLock},
 };
 
 use crate::{SparseVector, partition::build_inverted_index, tombstone::Tombstones};
@@ -36,7 +36,7 @@ impl Error for DeltaError {}
 
 #[derive(Debug, Clone)]
 pub struct Delta {
-    pub docs: Vec<SparseVector>,
+    pub docs: Vec<Arc<SparseVector>>,
     pub postings: HashMap<u32, Vec<(u32, f32)>>,
 }
 
@@ -49,7 +49,7 @@ impl Default for Delta {
     }
 }
 
-pub fn delta_insert(delta: &mut Delta, vector: SparseVector) {
+pub fn delta_insert(delta: &mut Delta, vector: Arc<SparseVector>) {
     let local_base = delta.docs.len();
     for (t, w) in vector.indices.iter().zip(vector.values.iter()) {
         delta
@@ -137,9 +137,55 @@ pub fn persist_delta_insert(
         .map_err(|e| DeltaError::IO(format!("Error while writing to file: {e}")))?;
     op.flush()
         .map_err(|e| DeltaError::IO(format!("Error while flushing: {e}")))?;
-    delta_insert(&mut delta_m, validated);
+    delta_insert(&mut delta_m, Arc::new(validated));
     drop(delta_m);
     Ok(ext_id)
+}
+
+pub fn persist_batch_inserts(
+    vectors: Vec<Arc<SparseVector>>,
+    delta: &RwLock<Delta>,
+    log_dir: &Path,
+    ext_base: u32,
+) -> Result<Vec<u32>, DeltaError> {
+    let mut delta_m = delta.write().map_err(|_| DeltaError::Mutex)?;
+    if delta_m.docs.len() >= MAX_DELTA {
+        drop(delta_m);
+        return Err(DeltaError::IsFull);
+    }
+    let op = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(log_dir.join(DELTA_LOG_FILE))
+        .map_err(|e| DeltaError::IO(format!("Could not open delta file: {e}")))?;
+    let mut writer = BufWriter::new(op);
+    let mut ids = vec![];
+
+    for v in vectors {
+        let ext_id = ext_base + delta_m.docs.len() as u32;
+        let mut content: Vec<u8> = Vec::with_capacity(v.indices.len() * 8 + 8);
+        content.extend_from_slice(
+            &u32::try_from(v.indices.len())
+                .expect("Should convert to u32")
+                .to_le_bytes(),
+        );
+        for i in v.indices.iter() {
+            content.extend_from_slice(&(i.to_le_bytes()));
+        }
+        for v in v.values.iter() {
+            content.extend_from_slice(&v.to_le_bytes());
+        }
+        content.extend_from_slice(&ext_id.to_le_bytes());
+        writer
+            .write_all(&content)
+            .map_err(|e| DeltaError::IO(e.to_string()))?;
+        delta_insert(&mut delta_m, v);
+        ids.push(ext_id);
+    }
+
+    writer.flush().map_err(|e| DeltaError::IO(e.to_string()))?;
+
+    Ok(ids)
 }
 
 fn read_u32(b: &[u8], at: usize) -> u32 {
@@ -185,7 +231,7 @@ pub fn load_delta(log_dir: &Path, ext_base: u32) -> Result<Delta, String> {
         },
     };
     let mut pos = 0;
-    let mut docs: Vec<SparseVector> = vec![];
+    let mut docs: Vec<Arc<SparseVector>> = vec![];
     loop {
         let opt = read_record(&content, pos);
         if let Some((v, i, new_pos)) = opt {
@@ -199,7 +245,7 @@ pub fn load_delta(log_dir: &Path, ext_base: u32) -> Result<Delta, String> {
                 return Err(format!("The log records exceed {MAX_DELTA}"));
             }
             pos = new_pos;
-            docs.push(v);
+            docs.push(Arc::new(v));
         } else {
             if pos < content.len() {
                 let fl = fs::OpenOptions::new()
@@ -216,7 +262,10 @@ pub fn load_delta(log_dir: &Path, ext_base: u32) -> Result<Delta, String> {
                 drop(fl);
             }
             let postings = build_inverted_index(
-                &docs.iter().collect::<Vec<&SparseVector>>(),
+                &docs
+                    .iter()
+                    .map(|v| v.as_ref())
+                    .collect::<Vec<&SparseVector>>(),
                 // uses local ids
                 &docs
                     .iter()

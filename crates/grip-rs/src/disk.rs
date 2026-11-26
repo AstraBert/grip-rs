@@ -46,6 +46,7 @@ pub fn write_vectors<'a, T: ToBytes + FromBytes + 'a, V: Vector<'a, T>>(
 pub fn decode_sparse_vectors_raw(
     blob: &Mmap,
     indices: Option<Vec<usize>>,
+    use_sequential: bool,
 ) -> Result<Vec<Vec<(u32, f32)>>, String> {
     let l = u64::from_le_bytes(blob[0..8].try_into().expect("Should convert to [u8; 8]"));
     let to_read = if let Some(idx) = indices {
@@ -59,7 +60,7 @@ pub fn decode_sparse_vectors_raw(
         (0..l as usize).collect()
     };
 
-    let vectors = if to_read.len() > RAYON_THRESHOLD {
+    let vectors = if to_read.len() > RAYON_THRESHOLD && !use_sequential {
         to_read
             .par_iter()
             .map(|i| {
@@ -139,6 +140,7 @@ pub fn decode_sparse_vectors_raw(
 pub fn decode_sparse_sketches(
     blob: &[u8],
     indices: Option<Vec<usize>>,
+    use_sequential: bool,
 ) -> Result<(Vec<usize>, Vec<u32>, Vec<u8>, f32), String> {
     let l = u64::from_le_bytes(blob[0..8].try_into().expect("Should convert to [u8; 8]"));
     let to_read = if let Some(idx) = indices {
@@ -154,7 +156,7 @@ pub fn decode_sparse_sketches(
 
     let scale = f32::from_le_bytes(blob[8..12].try_into().expect("Should convert to [u8; 4]"));
 
-    let vectors = if to_read.len() > RAYON_THRESHOLD {
+    let vectors = if to_read.len() > RAYON_THRESHOLD && !use_sequential {
         to_read
             .par_iter()
             .map(|i| {

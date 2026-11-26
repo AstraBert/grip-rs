@@ -25,6 +25,7 @@ use grip_rs::{
     search_all,
     tombstone::delete as tombstone_deletion,
 };
+use rayon::ThreadPoolBuilder;
 use serde::{Deserialize, Serialize};
 
 const MAX_EF: usize = 500;
@@ -156,6 +157,10 @@ struct CleanupArgs {
     /// Number of seed documents stored for each term
     #[arg(long, default_value_t = 64)]
     cleanup_entrypoint_seeds: usize,
+    /// Number of threads to dedicate to cleanup.
+    /// Defaults to half of the available cores.
+    #[arg(long, default_value = None)]
+    cleanup_threads: Option<usize>,
 }
 
 impl CleanupArgs {
@@ -609,6 +614,13 @@ async fn post_point(
     })
 }
 
+fn half_available_parallelism() -> usize {
+    let threads = std::thread::available_parallelism()
+        .map(|i| i.get())
+        .unwrap_or(1);
+    threads.div_ceil(2)
+}
+
 #[actix_web::main]
 async fn main() -> Result<(), String> {
     let args = Args::parse();
@@ -643,6 +655,14 @@ async fn main() -> Result<(), String> {
     let cleanup_params = args.cleanup.to_params(args.vocab_size);
     let cleanup_dir = args.index_dir.clone();
     let (tx, rx) = mpsc::channel::<()>();
+    let cleanup_pool = ThreadPoolBuilder::new()
+        .num_threads(
+            args.cleanup
+                .cleanup_threads
+                .unwrap_or(half_available_parallelism()),
+        )
+        .build()
+        .map_err(|e| e.to_string())?;
 
     let handle = thread::spawn(move || {
         loop {
@@ -677,7 +697,7 @@ async fn main() -> Result<(), String> {
                         continue;
                     }
                     drop(mi_read);
-                    match cleanup(mi, &cleanup_dir, &cleanup_params) {
+                    match cleanup_pool.install(|| cleanup(mi, &cleanup_dir, &cleanup_params)) {
                         Ok(()) => continue,
                         Err(e) => {
                             log::error!("[CLEANUP THREAD] Error while executing cleanup: {e}");

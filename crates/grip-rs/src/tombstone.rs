@@ -1,6 +1,6 @@
 use std::{
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, BufWriter, Write},
     path::Path,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
@@ -9,8 +9,8 @@ pub const DELETION_LOG_FILE: &'static str = "delete.log";
 
 #[derive(Debug)]
 pub struct Tombstones {
-    words: Vec<AtomicU64>,
-    count: AtomicUsize,
+    pub words: Vec<AtomicU64>,
+    pub count: AtomicUsize,
 }
 
 impl Tombstones {
@@ -82,6 +82,37 @@ pub fn delete(
     fl.flush()?;
 
     Ok(true)
+}
+
+pub fn delete_batch(
+    ids: &[u32],
+    tombstones: &Tombstones,
+    log_dir: &Path,
+    documents_count: usize,
+) -> io::Result<Vec<bool>> {
+    if ids.iter().any(|i| *i as usize > documents_count) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Could not find one or more of the points to delete",
+        ));
+    }
+
+    let fl = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(log_dir.join(DELETION_LOG_FILE))?;
+    let mut writer = BufWriter::new(fl);
+    let mut deletion_mask = vec![];
+
+    for i in ids {
+        let deleted = tombstones.delete(*i);
+        deletion_mask.push(deleted);
+        writer.write_all(&i.to_le_bytes())?;
+    }
+
+    writer.flush()?;
+
+    Ok(deletion_mask)
 }
 
 pub fn load_tombstones(tombstones: &Tombstones, log_dir: &Path) -> io::Result<()> {

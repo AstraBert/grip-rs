@@ -354,7 +354,7 @@ pub fn save_vectors_and_sketches(
 
 pub fn read_sketches(src: impl AsRef<Path>) -> Result<VectorsAndSketches, String> {
     let content = fs::read(src).map_err(|e| e.to_string())?;
-    let (offsets, indices, values, scale) = decode_sparse_sketches(&content, None)?;
+    let (offsets, indices, values, scale) = decode_sparse_sketches(&content, None, false)?;
     Ok(VectorsAndSketches {
         offsets,
         indices,

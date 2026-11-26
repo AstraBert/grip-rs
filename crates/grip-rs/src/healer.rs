@@ -105,7 +105,7 @@ pub fn heal(
 
                 let mut ids = live_nb.iter().map(|v| *v as usize).collect::<Vec<usize>>();
                 ids.insert(0, p);
-                let vectors = decode_sparse_vectors_raw(&vectors_mmap, Some(ids))?;
+                let vectors = decode_sparse_vectors_raw(&vectors_mmap, Some(ids), true)?;
                 for (t, w) in vectors[0].iter() {
                     s.dense_scatter[*t as usize] = *w;
                 }
