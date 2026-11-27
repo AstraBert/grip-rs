@@ -600,7 +600,15 @@ async fn post_point(
     }
 
     let req = request.into_inner();
+    let t_wait = Instant::now();
     let mi = data.index.read().map_err(|_| UpdateError::Mutex)?;
+    let waited = t_wait.elapsed();
+    if waited > Duration::from_millis(100) {
+        log::warn!(
+            "[SLOW INSERT] waited {:.1}ms for the index lock",
+            waited.as_secs_f32() * 1000.0
+        );
+    }
     let ext_id = persist_delta_insert(
         req.indices,
         req.values,
@@ -612,6 +620,28 @@ async fn post_point(
     Ok(UpdateResponse {
         external_id: ext_id,
     })
+}
+
+/// Runs on each actix worker. It asks the worker's event loop to wake it up every 10 ms
+/// and logs a warning when the wake-up is late. A late wake-up means the worker thread
+/// was blocked (a handler waiting on something) or did not get the CPU.
+async fn worker_lag_probe() {
+    const TICK: Duration = Duration::from_millis(10);
+    const WARN_AFTER: Duration = Duration::from_millis(100);
+    let thread = thread::current();
+    let name = thread.name().unwrap_or("unnamed worker").to_string();
+    log::info!("[WORKER LAG] probe started on {name}");
+    loop {
+        let before = Instant::now();
+        actix_web::rt::time::sleep(TICK).await;
+        let late = before.elapsed().saturating_sub(TICK);
+        if late > WARN_AFTER {
+            log::warn!(
+                "[WORKER LAG] {name} woke up {:.1}ms late",
+                late.as_secs_f32() * 1000.0
+            );
+        }
+    }
 }
 
 fn half_available_parallelism() -> usize {
@@ -710,6 +740,8 @@ async fn main() -> Result<(), String> {
     });
 
     HttpServer::new(move || {
+        // this closure runs once on each worker thread
+        actix_web::rt::spawn(worker_lag_probe());
         App::new()
             .app_data(state.clone())
             .route("/health", web::get().to(HttpResponse::Ok))
@@ -719,7 +751,7 @@ async fn main() -> Result<(), String> {
             .route("/points", web::post().to(post_point))
     })
     .workers(args.num_workers)
-    .bind((args.host.as_deref().unwrap_or("localhost"), args.port))
+    .bind((args.host.as_deref().unwrap_or("127.0.0.1"), args.port))
     .map_err(|e| e.to_string())?
     .run()
     .await

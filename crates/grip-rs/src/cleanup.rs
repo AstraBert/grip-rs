@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
     ptr::replace,
     sync::{Arc, RwLock, atomic::Ordering},
+    time::Instant,
 };
 
 use memmap2::{Advice, Mmap};
@@ -238,12 +239,15 @@ pub fn cleanup(
     base_dir: &Path,
     params: &CleanupParams,
 ) -> Result<(), String> {
+    let start = Instant::now();
     let rlock_mi = mutable_index.read().map_err(|e| e.to_string())?;
     let rlock_delta = rlock_mi.delta.read().map_err(|e| e.to_string())?;
     let delta_snap = rlock_delta.docs.clone();
     let delta_snap_len = delta_snap.len();
     drop(rlock_delta);
     let tombstones_snap = rlock_mi.tombstones.make_copy();
+    let snap_1 = Instant::now();
+    log::info!("Snapshotting: {}ms", start.elapsed().as_secs_f32() * 1000.0);
     let healed = heal(
         &rlock_mi.index_output.graph,
         &tombstones_snap,
@@ -253,6 +257,12 @@ pub fn cleanup(
         params.vocab_size,
         &rlock_mi.vectors_mmap,
     )?;
+    let snap_2 = Instant::now();
+    log::info!(
+        "Healing: {}ms (total: {}ms)",
+        snap_1.elapsed().as_secs_f32() * 1000.0,
+        start.elapsed().as_secs_f32() * 1000.0
+    );
     let index_dir_tmp_v = base_dir.join(format!("v{}.tmp", rlock_mi.version + 1));
     let index_dir_tmp = DropGuard::new(index_dir_tmp_v, |v| {
         // try deleting on drop.
@@ -283,6 +293,12 @@ pub fn cleanup(
         params.patience,
         params.max_query_dims,
     )?;
+    let snap_3 = Instant::now();
+    log::info!(
+        "Compaction: {}ms (total: {}ms)",
+        snap_2.elapsed().as_secs_f32() * 1000.0,
+        start.elapsed().as_secs_f32() * 1000.0
+    );
 
     let n_main_old = rlock_mi.ids.len();
 
@@ -299,6 +315,13 @@ pub fn cleanup(
         }
     }
 
+    let snap_4 = Instant::now();
+    log::info!(
+        "New index load: {}ms (total: {}ms)",
+        snap_3.elapsed().as_secs_f32() * 1000.0,
+        start.elapsed().as_secs_f32() * 1000.0
+    );
+
     // needs write lock so we don't
     // add or delete anything while
     // backfilling intermediate updates
@@ -312,7 +335,14 @@ pub fn cleanup(
     persist_batch_inserts(vectors_to_insert, &new.delta, &index_dir_tmp, new_ext_base)
         .map_err(|e| e.to_string())?;
 
-    let deleted_ids = old_tombstones
+    let snap_5 = Instant::now();
+    log::info!(
+        "Backfill delta: {}ms (total: {}ms)",
+        snap_4.elapsed().as_secs_f32() * 1000.0,
+        start.elapsed().as_secs_f32() * 1000.0
+    );
+
+    let mut deleted_ids = old_tombstones
         .words
         .iter()
         .enumerate()
@@ -333,10 +363,25 @@ pub fn cleanup(
         .flatten()
         .collect::<Vec<u32>>();
 
+    for id in deleted_ids.iter_mut() {
+        if *id < snap_total as u32 {
+            *id = old_to_new[*id as usize].unwrap() as u32;
+        } else {
+            *id = n_main_new as u32 + (*id - n_main_old as u32 - delta_snap_len as u32);
+        }
+    }
+
     let current_docs = n_main_new + rlocked_old_delta.docs.len() - delta_snap_len;
 
     delete_batch(&deleted_ids, &new.tombstones, &index_dir_tmp, current_docs)
         .map_err(|e| e.to_string())?;
+
+    let snap_6 = Instant::now();
+    log::info!(
+        "Backfill tombstones: {}ms (total: {}ms)",
+        snap_5.elapsed().as_secs_f32() * 1000.0,
+        start.elapsed().as_secs_f32() * 1000.0
+    );
 
     #[cfg(target_family = "unix")]
     new.vectors_mmap
@@ -354,6 +399,12 @@ pub fn cleanup(
 
     drop(wlocked_mi);
     drop(old);
+
+    log::info!(
+        "madvise(WILLNEED) + rename + swap: {}ms (total: {}ms)",
+        snap_6.elapsed().as_secs_f32() * 1000.0,
+        start.elapsed().as_secs_f32() * 1000.0
+    );
 
     Ok(())
 }

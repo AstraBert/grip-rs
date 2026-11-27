@@ -704,6 +704,7 @@ dependencies = [
  "clap",
  "half",
  "libc",
+ "log",
  "memmap2",
  "num-traits",
  "ordered-float",

@@ -6,12 +6,19 @@ use std::{
     io::{self, BufWriter, Write},
     path::Path,
     sync::{Arc, RwLock},
+    time::{Duration, Instant},
 };
 
 use crate::{SparseVector, partition::build_inverted_index, tombstone::Tombstones};
 
 pub const MAX_DELTA: usize = 50_000;
 pub const DELTA_LOG_FILE: &'static str = "delta.log";
+/// An insert slower than this is logged, with the time of each stage.
+const SLOW_INSERT: Duration = Duration::from_millis(100);
+
+fn ms(from: Instant, to: Instant) -> f32 {
+    to.duration_since(from).as_secs_f32() * 1000.0
+}
 
 #[derive(Debug)]
 pub enum DeltaError {
@@ -108,8 +115,11 @@ pub fn persist_delta_insert(
     log_dir: &Path,
     ext_base: u32,
 ) -> Result<u32, DeltaError> {
+    let t0 = Instant::now();
     let validated = SparseVector::new(indices, values).map_err(|e| DeltaError::Validation(e))?;
+    let t_validated = Instant::now();
     let mut delta_m = delta.write().map_err(|_| DeltaError::Mutex)?;
+    let t_locked = Instant::now();
     if delta_m.docs.len() >= MAX_DELTA {
         drop(delta_m);
         return Err(DeltaError::IsFull);
@@ -137,8 +147,22 @@ pub fn persist_delta_insert(
         .map_err(|e| DeltaError::IO(format!("Error while writing to file: {e}")))?;
     op.flush()
         .map_err(|e| DeltaError::IO(format!("Error while flushing: {e}")))?;
+    let t_written = Instant::now();
     delta_insert(&mut delta_m, Arc::new(validated));
     drop(delta_m);
+    let t_end = Instant::now();
+    // a slow insert: say which stage was slow
+    if t_end.duration_since(t0) > SLOW_INSERT {
+        log::warn!(
+            "[SLOW INSERT] {:.1}ms: validate {:.1}ms, wait for the delta lock {:.1}ms, \
+             write the log {:.1}ms, add to the delta {:.1}ms",
+            ms(t0, t_end),
+            ms(t0, t_validated),
+            ms(t_validated, t_locked),
+            ms(t_locked, t_written),
+            ms(t_written, t_end),
+        );
+    }
     Ok(ext_id)
 }
 
